@@ -213,19 +213,38 @@ def analyze_sl_reason(sig: dict) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 # Config persistence
 # ─────────────────────────────────────────────────────────────────────────────
-try:
-    _SCRIPT_DIR = pathlib.Path(__file__).parent.absolute()
-except Exception:
-    _SCRIPT_DIR = pathlib.Path.cwd()
+# Data is always saved to ~/Documents/CryptoDemoTrades/ — a fixed, reliable
+# location on the user's computer that survives app restarts, script moves,
+# and working-directory changes.  A fallback to the script's own directory is
+# tried first so that running multiple instances from different folders stays
+# independent; the home-Documents path is the final, always-writable fallback.
 
-_probe = _SCRIPT_DIR / ".write_probe"
-try:
-    _probe.touch(); _probe.unlink()
-except OSError:
+def _resolve_data_dir() -> pathlib.Path:
+    candidates = []
+    # 1. Same directory as the script (keeps data next to code when writable)
+    try:
+        candidates.append(pathlib.Path(__file__).parent.absolute())
+    except Exception:
+        pass
+    # 2. Stable home-directory location — survives script moves & restarts
+    candidates.append(pathlib.Path.home() / "Documents" / "CryptoDemoTrades")
+
+    for path in candidates:
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            probe = path / ".write_probe"
+            probe.touch(); probe.unlink()
+            return path          # first writable candidate wins
+        except OSError:
+            continue
+
+    # Last resort: temp dir (data won't survive OS restart — shown in UI)
     import tempfile
-    _SCRIPT_DIR = pathlib.Path(tempfile.gettempdir()) / "okx_scanner"
+    fallback = pathlib.Path(tempfile.gettempdir()) / "CryptoDemoTrades"
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
 
-_SCRIPT_DIR.mkdir(parents=True, exist_ok=True)
+_SCRIPT_DIR  = _resolve_data_dir()
 CONFIG_FILE  = _SCRIPT_DIR / "scanner_config.json"
 LOG_FILE     = _SCRIPT_DIR / "scanner_log.json"
 _config_lock = threading.Lock()
@@ -493,9 +512,13 @@ def _trade_post(path: str, body: dict, cfg: dict) -> dict:
     }
     if cfg.get("demo_mode", True):
         headers["x-simulated-trading"] = "1"
+    # Merge with session-level headers (User-Agent, Accept, etc.) so auth
+    # headers supplement rather than replace the defaults.
+    sess = get_session()
+    merged = {**dict(sess.headers), **headers}
     with _api_sem:
-        r = get_session().post(f"{BASE}{path}", headers=headers,
-                               data=body_str, timeout=20)
+        r = sess.post(f"{BASE}{path}", headers=merged,
+                      data=body_str, timeout=20)
     r.raise_for_status()
     return r.json()
 
@@ -513,9 +536,13 @@ def _trade_get(path: str, params: dict, cfg: dict) -> dict:
     }
     if cfg.get("demo_mode", True):
         headers["x-simulated-trading"] = "1"
+    # Merge with session-level headers (User-Agent, Accept, etc.) so auth
+    # headers supplement rather than replace the defaults.
+    sess = get_session()
+    merged = {**dict(sess.headers), **headers}
     with _api_sem:
-        r = get_session().get(f"{BASE}{path}", params=params,
-                              headers=headers, timeout=20)
+        r = sess.get(f"{BASE}{path}", params=params,
+                     headers=merged, timeout=20)
     r.raise_for_status()
     return r.json()
 
@@ -1319,7 +1346,7 @@ def _reset_filter_counts():
     with _filter_lock:
         _filter_counts.clear()
         _filter_counts.update(counts)
-    _b._bsc_filter_counts = _filter_counts
+        _b._bsc_filter_counts = _filter_counts   # keep reference in sync under lock
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Per-coin processing
@@ -2128,17 +2155,43 @@ with st.sidebar:
             )
     st.divider()
 
+    st.markdown("**💾 Data Storage**")
+    _is_temp = str(_SCRIPT_DIR).startswith(str(pathlib.Path(__import__("tempfile").gettempdir())))
+    if _is_temp:
+        st.warning(
+            f"⚠️ Saving to **temp directory** — data will be lost on OS restart!\n\n"
+            f"`{_SCRIPT_DIR}`\n\n"
+            "Move the script to a writable folder (e.g. Documents) to fix this.")
+    else:
+        st.caption(f"📁 Data folder: `{_SCRIPT_DIR}`")
+        st.caption(f"  • `scanner_log.json` — all signals (loaded on restart)")
+        st.caption(f"  • `scanner_config.json` — filters, API keys, settings")
+    st.divider()
+
     st.markdown("**🗑 Clear History**")
     if st.button("⚡ Flush All", use_container_width=True, type="secondary"):
+        # 1 — signals + health log
         with _log_lock:
             _b._bsc_log["signals"] = []
-            _b._bsc_log["health"]  = {"total_cycles":0,"last_scan_at":None,
-                                       "last_scan_duration_s":0.0,"total_api_errors":0,
-                                       "watchlist_size":0,"pre_filtered_out":0,"deep_scanned":0}
+            _b._bsc_log["health"]  = {
+                "total_cycles": 0, "last_scan_at": None,
+                "last_scan_duration_s": 0.0, "total_api_errors": 0,
+                "watchlist_size": 0, "pre_filtered_out": 0, "deep_scanned": 0,
+            }
             save_log(_b._bsc_log)
-        # Also clear the filter funnel so it doesn't show stale data
-        _filter_counts.clear()
-        _b._bsc_filter_counts = {}
+        # 2 — filter funnel (use _reset_filter_counts so the in-place dict
+        #     is reinitialised to zero-state, keeping the same object reference
+        #     that the scanner thread uses — avoids the split-reference bug)
+        _reset_filter_counts()
+        # 3 — API error log
+        with getattr(_b, "_bsc_error_log_lock", threading.Lock()):
+            if hasattr(_b, "_bsc_error_log"):
+                _b._bsc_error_log.clear()
+        # 4 — last trade debug panel + manual/test trade session results
+        _b._bsc_last_trade_raw = {}
+        _b._bsc_last_error     = ""
+        for _ss_key in ("_mt_last_result", "_test_trade_result"):
+            st.session_state.pop(_ss_key, None)
         st.success("✅ Flushed"); st.rerun()
 
     cd1, cd2 = st.columns(2)
