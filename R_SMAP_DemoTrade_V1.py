@@ -324,6 +324,8 @@ if "_scanner_initialised" not in st.session_state:
             "acct_lv":     "2",              # OKX account level (1=Simple, 2=Single-margin…)
         }
         _b._bsc_last_trade_raw  = {}         # full raw OKX response from last order attempt
+        _b._bsc_error_log       = []         # structured API error log (max 500 entries)
+        _b._bsc_error_log_lock  = threading.Lock()
         # D — symbol cache (also stores ctVal per symbol for position sizing)
         _b._bsc_symbol_cache  = {"symbols": [], "fetched_at": 0, "wl_key": "", "ct_val": {}}
     st.session_state["_scanner_initialised"] = True
@@ -376,7 +378,43 @@ def safe_get(url, params=None, _retries=4):
         except requests.exceptions.ConnectionError:
             if attempt < _retries - 1: time.sleep(3); continue
             raise
-    raise RuntimeError(f"Failed after {_retries} retries: {url}")
+    msg = f"Failed after {_retries} retries: {url}"
+    _append_error("http", msg, endpoint=url)
+    raise RuntimeError(msg)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Structured API error logger
+# ─────────────────────────────────────────────────────────────────────────────
+_ERROR_LOG_MAX = 500   # rolling cap — oldest entries are dropped beyond this
+
+def _append_error(err_type: str, message: str,
+                  symbol: str = "", endpoint: str = "") -> None:
+    """
+    Append one structured entry to the shared error log.
+
+    err_type : "scan" | "trade" | "loop" | "http"
+    message  : human-readable error string
+    symbol   : coin that triggered the error (empty for non-coin errors)
+    endpoint : OKX API path, if known
+    """
+    entry = {
+        "ts":       dubai_now().isoformat(),
+        "type":     err_type,
+        "symbol":   symbol,
+        "endpoint": endpoint,
+        "message":  message[:400],   # cap length for display
+    }
+    try:
+        lock = getattr(_b, "_bsc_error_log_lock", None)
+        log  = getattr(_b, "_bsc_error_log", None)
+        if lock is None or log is None:
+            return
+        with lock:
+            log.append(entry)
+            if len(log) > _ERROR_LOG_MAX:
+                del log[:len(log) - _ERROR_LOG_MAX]
+    except Exception:
+        pass   # never let the logger itself crash the scanner
 
 # ─────────────────────────────────────────────────────────────────────────────
 # OKX symbol helpers
@@ -681,12 +719,16 @@ def place_okx_order(sig: dict, cfg: dict) -> dict:
         ord_id = d0.get("ordId", "")
 
         if resp.get("code") != "0":
+            err = _okx_err(resp)
+            _append_error("trade", f"Entry order failed: {err}",
+                          symbol=sym, endpoint="/api/v5/trade/order")
             return {"ordId": "", "algoId": "", "sz": contracts,
-                    "status": "error", "error": _okx_err(resp)}
+                    "status": "error", "error": err}
         if d0.get("sCode", "0") != "0":
+            err = f"Entry order: {d0.get('sCode')}: {d0.get('sMsg','')}"
+            _append_error("trade", err, symbol=sym, endpoint="/api/v5/trade/order")
             return {"ordId": ord_id, "algoId": "", "sz": contracts,
-                    "status": "error",
-                    "error": f"Entry order: {d0.get('sCode')}: {d0.get('sMsg','')}"}
+                    "status": "error", "error": err}
 
         # ── Step 3: Place OCO algo (TP + SL) as a separate call ─────────────
         # In hedge mode, closing a long requires posSide="long" on the sell too.
@@ -710,7 +752,8 @@ def place_okx_order(sig: dict, cfg: dict) -> dict:
         if algo_resp.get("code") != "0" or (ad.get("sCode","0") != "0" and ad.get("sCode","")):
             algo_err = _okx_err(algo_resp) if algo_resp.get("code") != "0" \
                        else f"OCO algo: {ad.get('sCode')}: {ad.get('sMsg','')}"
-            # Entry is placed — mark as partial so the user knows
+            _append_error("trade", f"OCO algo failed (entry placed): {algo_err}",
+                          symbol=sym, endpoint="/api/v5/trade/order-algo")
             return {"ordId": ord_id, "algoId": "", "sz": contracts,
                     "status": "partial", "error": f"Entry ✅ · TP/SL ❌ {algo_err}"}
 
@@ -718,6 +761,8 @@ def place_okx_order(sig: dict, cfg: dict) -> dict:
                 "status": "placed", "error": ""}
 
     except Exception as exc:
+        _append_error("trade", str(exc), symbol=sig.get("symbol", ""),
+                      endpoint="/api/v5/trade/order")
         return {"ordId": "", "algoId": "", "sz": 0,
                 "status": "error", "error": str(exc)}
 
@@ -1261,9 +1306,10 @@ def process(sym, cfg: dict):
             "criteria":       criteria,
         }
 
-    except Exception:
+    except Exception as _proc_exc:
         with _filter_lock:
             _filter_counts["errors"] = _filter_counts.get("errors", 0) + 1
+        _append_error("scan", str(_proc_exc), symbol=sym)
         return "error"
 
 def scan(cfg: dict):
@@ -1399,6 +1445,7 @@ def _bg_loop():
             _b._bsc_last_error = ""
         except Exception as e:
             _b._bsc_last_error = str(e)
+            _append_error("loop", str(e))
         elapsed   = time.time() - t0
         sleep_sec = max(0, cfg["loop_minutes"] * 60 - elapsed)
         # Wait for sleep_sec, but wake immediately if Save & Apply triggers rescan
@@ -1924,6 +1971,82 @@ m8.metric("SL Hit ❌",     sl_count)
 
 if getattr(_b, "_bsc_last_error", ""):
     st.warning(f"⚠️ {_b._bsc_last_error}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# API Error Log
+# ─────────────────────────────────────────────────────────────────────────────
+with getattr(_b, "_bsc_error_log_lock", threading.Lock()):
+    _err_snap = list(getattr(_b, "_bsc_error_log", []))
+
+_TYPE_ICON = {"scan": "🔴", "trade": "🟠", "loop": "🟣", "http": "🔵"}
+_TYPE_LABEL = {"scan": "Scan/Candle", "trade": "Trade/Order",
+               "loop": "Scanner loop", "http": "HTTP/Network"}
+
+_err_count = len(_err_snap)
+_err_label = f"⚠️ API Error Log — {_err_count} entr{'y' if _err_count == 1 else 'ies'}"
+
+with st.expander(_err_label, expanded=(_err_count > 0)):
+    if not _err_snap:
+        st.success("✅ No errors recorded yet.")
+    else:
+        ecol1, ecol2 = st.columns([1, 1])
+
+        # ── Summary counts by type ─────────────────────────────────────────
+        _type_counts = {}
+        for _e in _err_snap:
+            _type_counts[_e["type"]] = _type_counts.get(_e["type"], 0) + 1
+        _summary = "  ·  ".join(
+            f"{_TYPE_ICON.get(t,'⚪')} {_TYPE_LABEL.get(t,t)}: **{n}**"
+            for t, n in sorted(_type_counts.items())
+        )
+        ecol1.markdown(_summary)
+
+        # ── Clear button ──────────────────────────────────────────────────
+        if ecol2.button("🗑 Clear error log", key="clear_err_log"):
+            with _b._bsc_error_log_lock:
+                _b._bsc_error_log.clear()
+            st.rerun()
+
+        # ── Type filter ───────────────────────────────────────────────────
+        _all_types = sorted({e["type"] for e in _err_snap})
+        _filt_cols = st.columns(len(_all_types) + 1)
+        _sel_type  = st.session_state.get("err_type_filter", "All")
+        if _filt_cols[0].button("All", key="err_f_all",
+                                type="primary" if _sel_type == "All" else "secondary"):
+            st.session_state["err_type_filter"] = "All"; st.rerun()
+        for _fi, _ft in enumerate(_all_types):
+            if _filt_cols[_fi + 1].button(
+                    f"{_TYPE_ICON.get(_ft,'')} {_TYPE_LABEL.get(_ft,_ft)}",
+                    key=f"err_f_{_ft}",
+                    type="primary" if _sel_type == _ft else "secondary"):
+                st.session_state["err_type_filter"] = _ft; st.rerun()
+
+        # ── Error table ───────────────────────────────────────────────────
+        _sel_type = st.session_state.get("err_type_filter", "All")
+        _shown = [e for e in reversed(_err_snap)
+                  if _sel_type == "All" or e["type"] == _sel_type]
+        _err_rows = []
+        for _e in _shown:
+            _err_rows.append({
+                "Time (GST)": fmt_dubai(_e["ts"]),
+                "Type":       f"{_TYPE_ICON.get(_e['type'],'')} {_TYPE_LABEL.get(_e['type'],_e['type'])}",
+                "Symbol":     _e.get("symbol", "—") or "—",
+                "Endpoint":   _e.get("endpoint", "—") or "—",
+                "Error":      _e.get("message", ""),
+            })
+        st.dataframe(
+            _err_rows,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Time (GST)": st.column_config.TextColumn(width="small"),
+                "Type":       st.column_config.TextColumn(width="medium"),
+                "Symbol":     st.column_config.TextColumn(width="small"),
+                "Endpoint":   st.column_config.TextColumn(width="medium"),
+                "Error":      st.column_config.TextColumn(width="large"),
+            },
+        )
+        st.caption(f"Showing {len(_err_rows)} of {_err_count} entries (newest first) · max {_ERROR_LOG_MAX} kept")
 st.divider()
 
 # ── Active filter badges ───────────────────────────────────────────────────────
