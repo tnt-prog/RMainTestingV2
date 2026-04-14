@@ -322,6 +322,7 @@ if "_scanner_initialised" not in st.session_state:
             "uid":         "",               # OKX account UID on success
             "pos_mode":    "net_mode",       # "net_mode" | "long_short_mode" (hedge)
         }
+        _b._bsc_last_trade_raw  = {}         # full raw OKX response from last order attempt
         # D — symbol cache (also stores ctVal per symbol for position sizing)
         _b._bsc_symbol_cache  = {"symbols": [], "fetched_at": 0, "wl_key": "", "ct_val": {}}
     st.session_state["_scanner_initialised"] = True
@@ -621,6 +622,15 @@ def place_okx_order(sig: dict, cfg: dict) -> dict:
             order_body["posSide"] = "long"   # required in Long/Short (hedge) mode
 
         resp   = _trade_post("/api/v5/trade/order", order_body, cfg)
+        # Store full raw response for debugging (visible in UI)
+        _b._bsc_last_trade_raw = {
+            "endpoint":    "/api/v5/trade/order",
+            "body_sent":   order_body,
+            "response":    resp,
+            "is_hedge":    is_hedge,
+            "contracts":   contracts,
+            "ct_val":      ct_val,
+        }
         d0     = (resp.get("data") or [{}])[0]
         ord_id = d0.get("ordId", "")
 
@@ -1476,9 +1486,71 @@ with st.sidebar:
     if _conn_status == "ok":
         _pm = _conn_now.get("pos_mode", "net_mode")
         if _pm == "long_short_mode":
-            st.info("📐 Position mode: **Hedge (Long/Short)** — `posSide: long` will be added to all orders automatically.")
+            st.info("📐 Position mode: **Hedge (Long/Short)** — `posSide: long` added to orders automatically.")
         else:
             st.info("📐 Position mode: **Net** — standard order placement.")
+
+    # ── Test Trade button (places + cancels a minimal BTCUSDT order) ──────────
+    _conn_ok = _conn_status == "ok" and _snap_cfg.get("trade_enabled", False)
+    if st.button("🧪 Test Trade (BTC · 1 contract)", use_container_width=True,
+                 disabled=not _conn_ok,
+                 help="Places a 1-contract market buy on BTCUSDT, then immediately cancels it. "
+                      "Use this to confirm order placement works before signals fire."):
+        with st.spinner("Placing test order…"):
+            _tc = dict(_snap_cfg)
+            _cs = getattr(_b, "_bsc_api_conn_status", {})
+            _is_h = _cs.get("pos_mode", "net_mode") == "long_short_mode"
+            _mode = _tc.get("trade_margin_mode", "cross")
+
+            # Set leverage
+            try:
+                _set_leverage_okx("BTCUSDT", _tc)
+            except Exception:
+                pass
+
+            _tbody: dict = {
+                "instId":  "BTC-USDT-SWAP",
+                "tdMode":  _mode,
+                "side":    "buy",
+                "ordType": "market",
+                "sz":      "1",
+            }
+            if _is_h:
+                _tbody["posSide"] = "long"
+
+            _tresp = _trade_post("/api/v5/trade/order", _tbody, _tc)
+            _b._bsc_last_trade_raw = {
+                "endpoint":  "/api/v5/trade/order",
+                "body_sent": _tbody,
+                "response":  _tresp,
+                "is_hedge":  _is_h,
+            }
+
+            # Immediately cancel if placed
+            _td0    = (_tresp.get("data") or [{}])[0]
+            _tordid = _td0.get("ordId", "")
+            if _tresp.get("code") == "0" and _tordid:
+                try:
+                    _trade_post("/api/v5/trade/cancel-order",
+                                {"instId": "BTC-USDT-SWAP", "ordId": _tordid}, _tc)
+                except Exception:
+                    pass
+                st.success(f"✅ Test order placed & cancelled · ordId: {_tordid}")
+            else:
+                st.error(f"❌ {_okx_err(_tresp)}")
+        st.rerun()
+
+    # ── Raw response debug expander ───────────────────────────────────────────
+    _raw = getattr(_b, "_bsc_last_trade_raw", {})
+    if _raw:
+        with st.expander("🔬 Last order raw response (debug)"):
+            st.caption("Body sent to OKX:")
+            st.json(_raw.get("body_sent", {}))
+            st.caption("OKX response:")
+            st.json(_raw.get("response", {}))
+            st.caption(f"is_hedge={_raw.get('is_hedge')}  "
+                       f"contracts={_raw.get('contracts','?')}  "
+                       f"ct_val={_raw.get('ct_val','?')}")
     st.divider()
 
     st.markdown("**📊 Trade Settings**")
