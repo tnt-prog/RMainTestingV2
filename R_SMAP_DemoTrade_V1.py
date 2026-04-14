@@ -770,7 +770,35 @@ def place_okx_order(sig: dict, cfg: dict) -> dict:
             return {"ordId": ord_id, "algoId": "", "sz": contracts,
                     "status": "error", "error": err}
 
-        # ── Step 3: Place OCO algo (TP + SL) as a separate call ─────────────
+        # ── Step 3: Fetch actual fill price (avgPx) ───────────────────────────
+        # Market orders fill at the live market price, which differs from the
+        # signal's entry price (captured up to loop_minutes ago).
+        # We must recalculate TP and SL from the real fill price so the
+        # percentage targets match what the user configured.
+        actual_entry = entry   # fallback to signal entry if fetch fails
+        time.sleep(0.3)        # brief pause — give OKX time to record the fill
+        try:
+            fill_resp = _trade_get(
+                "/api/v5/trade/order",
+                {"instId": _to_okx(sym), "ordId": ord_id},
+                cfg)
+            if fill_resp.get("code") == "0":
+                fill_d = fill_resp.get("data", [{}])[0]
+                avg_px = float(fill_d.get("avgPx", 0) or 0)
+                if avg_px > 0:
+                    actual_entry = avg_px
+        except Exception as fill_exc:
+            _append_error("trade",
+                          f"Could not fetch fill price, using signal entry: {fill_exc}",
+                          symbol=sym, endpoint="/api/v5/trade/order[GET]")
+
+        # Recalculate TP and SL from the actual fill price
+        tp_pct   = float(cfg.get("tp_pct", 1.5)) / 100
+        sl_pct   = float(cfg.get("sl_pct", 3.0)) / 100
+        actual_tp = _pround(actual_entry * (1 + tp_pct))
+        actual_sl = _pround(actual_entry * (1 - sl_pct))
+
+        # ── Step 4: Place OCO algo (TP + SL) using actual fill price ─────────
         # In hedge mode, closing a long requires posSide="long" on the sell too.
         algo_body: dict = {
             "instId":       _to_okx(sym),
@@ -778,9 +806,9 @@ def place_okx_order(sig: dict, cfg: dict) -> dict:
             "side":         "sell",
             "ordType":      "oco",
             "sz":           str(contracts),
-            "tpTriggerPx":  str(_pround(tp)),
+            "tpTriggerPx":  str(actual_tp),
             "tpOrdPx":      "-1",    # market fill when TP triggers
-            "slTriggerPx":  str(_pround(sl)),
+            "slTriggerPx":  str(actual_sl),
             "slOrdPx":      "-1",    # market fill when SL triggers
         }
         if is_hedge:
@@ -795,14 +823,168 @@ def place_okx_order(sig: dict, cfg: dict) -> dict:
             _append_error("trade", f"OCO algo failed (entry placed): {algo_err}",
                           symbol=sym, endpoint="/api/v5/trade/order-algo")
             return {"ordId": ord_id, "algoId": "", "sz": contracts,
-                    "status": "partial", "error": f"Entry ✅ · TP/SL ❌ {algo_err}"}
+                    "status": "partial", "error": f"Entry ✅ · TP/SL ❌ {algo_err}",
+                    "actual_entry": actual_entry,
+                    "actual_tp": actual_tp, "actual_sl": actual_sl}
 
         return {"ordId": ord_id, "algoId": algo_id, "sz": contracts,
-                "status": "placed", "error": ""}
+                "status": "placed", "error": "",
+                "actual_entry": actual_entry,
+                "actual_tp": actual_tp, "actual_sl": actual_sl}
 
     except Exception as exc:
         _append_error("trade", str(exc), symbol=sig.get("symbol", ""),
                       endpoint="/api/v5/trade/order")
+        return {"ordId": "", "algoId": "", "sz": 0,
+                "status": "error", "error": str(exc)}
+
+def place_okx_manual_order(sym: str, entry: float, tp: float, sl: float,
+                           cfg: dict) -> dict:
+    """
+    Place a manually specified order:
+      • entry > 0  → LIMIT buy at exactly that price, TP/SL used as-is
+      • entry == 0 → MARKET buy at live price, TP/SL used as-is (no recalc)
+
+    Unlike place_okx_order (auto-trading), this function never recalculates
+    TP or SL — the user's values are sent directly to OKX.
+
+    Returns {"ordId", "algoId", "sz", "status", "error",
+             "actual_entry", "actual_tp", "actual_sl"}
+    """
+    try:
+        usdt   = float(cfg.get("trade_usdt_amount", 10))
+        lev    = min(int(cfg.get("trade_leverage", 10)), get_max_leverage(sym))
+        mode   = cfg.get("trade_margin_mode", "cross")
+
+        # Pre-trade instrument check
+        ct_cache = _b._bsc_symbol_cache.get("ct_val", {})
+        if ct_cache and sym not in ct_cache:
+            err = f"Instrument {_to_okx(sym)} not found in OKX live SWAP list."
+            _append_error("trade", err, symbol=sym)
+            return {"ordId": "", "algoId": "", "sz": 0,
+                    "status": "error", "error": err}
+
+        ct_val = _get_ct_val(sym)
+        ref_price = entry if entry > 0 else None
+
+        # If no entry price given, fetch live market price for sizing
+        if ref_price is None:
+            try:
+                tick = safe_get(f"{BASE}/api/v5/market/ticker",
+                                {"instId": _to_okx(sym)})
+                ref_price = float(tick.get("data", [{}])[0].get("last", 0) or 0)
+            except Exception:
+                pass
+        if not ref_price or ref_price <= 0:
+            return {"ordId": "", "algoId": "", "sz": 0, "status": "error",
+                    "error": "Could not determine price for contract sizing."}
+
+        contracts = max(1, int((usdt * lev) / (ct_val * ref_price)))
+
+        # Position mode
+        is_hedge = False
+        try:
+            _pm_resp = _trade_get("/api/v5/account/config", {}, cfg)
+            if _pm_resp.get("code") == "0":
+                _pm      = _pm_resp.get("data", [{}])[0].get("posMode", "net_mode")
+                is_hedge = (_pm == "long_short_mode")
+                _cs = getattr(_b, "_bsc_api_conn_status", None)
+                if _cs is not None:
+                    _cs["pos_mode"] = _pm
+        except Exception:
+            is_hedge = (getattr(_b, "_bsc_api_conn_status", {})
+                        .get("pos_mode", "net_mode") == "long_short_mode")
+
+        # Set leverage
+        try:
+            _set_leverage_okx(sym, cfg)
+        except Exception as lev_exc:
+            _append_error("trade", f"set-leverage warning: {lev_exc}", symbol=sym)
+
+        # ── Entry order ───────────────────────────────────────────────────────
+        if entry > 0:
+            # LIMIT order at the user-specified price
+            order_body: dict = {
+                "instId":  _to_okx(sym),
+                "tdMode":  mode,
+                "side":    "buy",
+                "ordType": "limit",
+                "px":      str(_pround(entry)),
+                "sz":      str(contracts),
+            }
+        else:
+            # MARKET order — fill at live price
+            order_body = {
+                "instId":  _to_okx(sym),
+                "tdMode":  mode,
+                "side":    "buy",
+                "ordType": "market",
+                "sz":      str(contracts),
+            }
+        if is_hedge:
+            order_body["posSide"] = "long"
+
+        resp   = _trade_post("/api/v5/trade/order", order_body, cfg)
+        _b._bsc_last_trade_raw = {
+            "endpoint":  "/api/v5/trade/order",
+            "body_sent": order_body,
+            "response":  resp,
+            "is_hedge":  is_hedge,
+            "contracts": contracts,
+            "ct_val":    ct_val,
+        }
+        d0     = (resp.get("data") or [{}])[0]
+        ord_id = d0.get("ordId", "")
+
+        if resp.get("code") != "0":
+            err = _okx_err(resp)
+            _append_error("trade",
+                          f"{err} | body={json.dumps(order_body)} | resp={json.dumps(resp)[:300]}",
+                          symbol=sym, endpoint="/api/v5/trade/order")
+            return {"ordId": "", "algoId": "", "sz": contracts,
+                    "status": "error", "error": err}
+        if d0.get("sCode", "0") != "0":
+            err = f"Entry order: {d0.get('sCode')}: {d0.get('sMsg','')}"
+            _append_error("trade", f"{err} | body={json.dumps(order_body)}",
+                          symbol=sym, endpoint="/api/v5/trade/order")
+            return {"ordId": ord_id, "algoId": "", "sz": contracts,
+                    "status": "error", "error": err}
+
+        # ── OCO algo with user-specified TP/SL (no recalculation) ─────────────
+        algo_body: dict = {
+            "instId":      _to_okx(sym),
+            "tdMode":      mode,
+            "side":        "sell",
+            "ordType":     "oco",
+            "sz":          str(contracts),
+            "tpTriggerPx": str(_pround(tp)),
+            "tpOrdPx":     "-1",
+            "slTriggerPx": str(_pround(sl)),
+            "slOrdPx":     "-1",
+        }
+        if is_hedge:
+            algo_body["posSide"] = "long"
+
+        algo_resp = _trade_post("/api/v5/trade/order-algo", algo_body, cfg)
+        ad        = (algo_resp.get("data") or [{}])[0]
+        algo_id   = ad.get("algoId", "")
+
+        if algo_resp.get("code") != "0" or (ad.get("sCode","0") != "0" and ad.get("sCode","")):
+            algo_err = _okx_err(algo_resp) if algo_resp.get("code") != "0" \
+                       else f"OCO: {ad.get('sCode')}: {ad.get('sMsg','')}"
+            _append_error("trade", f"OCO algo failed: {algo_err}",
+                          symbol=sym, endpoint="/api/v5/trade/order-algo")
+            return {"ordId": ord_id, "algoId": "", "sz": contracts,
+                    "status": "partial",
+                    "error": f"Entry ✅ · TP/SL ❌ {algo_err}",
+                    "actual_entry": entry, "actual_tp": tp, "actual_sl": sl}
+
+        return {"ordId": ord_id, "algoId": algo_id, "sz": contracts,
+                "status": "placed", "error": "",
+                "actual_entry": entry, "actual_tp": tp, "actual_sl": sl}
+
+    except Exception as exc:
+        _append_error("trade", str(exc), symbol=sym, endpoint="/api/v5/trade/order")
         return {"ordId": "", "algoId": "", "sz": 0,
                 "status": "error", "error": str(exc)}
 
@@ -1480,6 +1662,14 @@ def _bg_loop():
                     sig["trade_usdt"]   = float(cfg.get("trade_usdt_amount", 0))
                     sig["trade_lev"]    = int(cfg.get("trade_leverage", 10))
                     sig["demo_mode"]    = bool(cfg.get("demo_mode", True))
+                    # Overwrite entry/TP/SL with actual fill values if available.
+                    # Market orders fill at the live price, not the signal price —
+                    # the OCO algo order was placed using these corrected levels.
+                    if result.get("actual_entry"):
+                        sig["entry"]        = result["actual_entry"]
+                        sig["tp"]           = result["actual_tp"]
+                        sig["sl"]           = result["actual_sl"]
+                        sig["signal_entry"] = sig.get("entry")  # keep original for reference
                 with _log_lock:
                     save_log(_b._bsc_log)
             _b._bsc_last_error = ""
@@ -2229,7 +2419,8 @@ if filtered_sorted:
             "Symbol":         s.get("symbol",""),
             "Setup":          setup_type,
             "Sector":         s.get("sector","Other"),
-            "Entry":          s.get("entry",""),
+            "Signal Entry":   s.get("signal_entry", s.get("entry","")),
+            "Fill $":         s.get("entry","") if s.get("signal_entry") else "—",
             "TP":             s.get("tp",""),
             "TP $":           tp_usd_str,
             "SL":             s.get("sl",""),
@@ -2248,7 +2439,10 @@ if filtered_sorted:
     st.dataframe(rows, use_container_width=True, hide_index=True,
                  column_config={
                      "Setup":          st.column_config.TextColumn(width="small"),
-                     "Entry":          st.column_config.NumberColumn(format="%.8f"),
+                     "Signal Entry":   st.column_config.NumberColumn(format="%.8f",
+                                           help="Price when the scanner signal fired"),
+                     "Fill $":         st.column_config.NumberColumn(format="%.8f",
+                                           help="Actual market fill price (may differ from signal entry)"),
                      "TP":             st.column_config.NumberColumn(format="%.8f"),
                      "TP $":           st.column_config.TextColumn(width="small"),
                      "SL":             st.column_config.NumberColumn(format="%.8f"),
@@ -2328,39 +2522,31 @@ with st.expander("🤖 Manual Trade", expanded=False):
             st.caption(f"ℹ️ Pre-filled from open signal for {mt_sym} "
                        f"(entry {_mt_entry_def}, TP {_mt_tp_def}, SL {_mt_sl_def})")
 
+        # Hint: if TP/SL are 0, show what will be calculated
+        if mt_entry > 0:
+            _mt_tp_hint = mt_tp if mt_tp > 0 else mt_entry * (1 + _snap_cfg.get("tp_pct",1.5)/100)
+            _mt_sl_hint = mt_sl if mt_sl > 0 else mt_entry * (1 - _snap_cfg.get("sl_pct",3.0)/100)
+            st.caption(f"📋 Will place **LIMIT** buy at {mt_entry} "
+                       f"· TP: {_pround(_mt_tp_hint)} · SL: {_pround(_mt_sl_hint)}")
+        else:
+            st.caption("📋 Entry = 0 → **MARKET** buy at live price · "
+                       "TP/SL from configured % if left at 0")
+
         if st.button("🚀 Place Manual Trade", type="primary", key="mt_place"):
-            # Build a synthetic signal dict the same shape as a real one
             _mt_cfg = dict(_snap_cfg)
             _mt_cfg["trade_usdt_amount"] = mt_usdt
             _mt_cfg["trade_leverage"]    = mt_lev
             _mt_cfg["trade_margin_mode"] = mt_mode
 
-            # If entry is 0, fetch the current market price
-            _mt_use_entry = mt_entry
-            if _mt_use_entry <= 0:
-                try:
-                    _mt_ticker = safe_get(
-                        f"{BASE}/api/v5/market/ticker",
-                        {"instId": _to_okx(mt_sym)})
-                    _mt_use_entry = float(
-                        _mt_ticker.get("data", [{}])[0].get("last", 0))
-                    st.info(f"Live price fetched: {_mt_use_entry}")
-                except Exception as _mte:
-                    st.error(f"Could not fetch live price: {_mte}")
-                    st.stop()
+            # TP/SL: use user values if provided, else fall back to config %
+            # (only relevant when entry == 0, i.e. market order)
+            _ref = mt_entry if mt_entry > 0 else 0
+            _mt_tp_use = mt_tp if mt_tp > 0 else (_ref * (1 + _snap_cfg.get("tp_pct",1.5)/100) if _ref else 0)
+            _mt_sl_use = mt_sl if mt_sl > 0 else (_ref * (1 - _snap_cfg.get("sl_pct",3.0)/100) if _ref else 0)
 
-            _mt_tp_use = mt_tp if mt_tp > 0 else _mt_use_entry * (1 + _snap_cfg.get("tp_pct", 1.5) / 100)
-            _mt_sl_use = mt_sl if mt_sl > 0 else _mt_use_entry * (1 - _snap_cfg.get("sl_pct", 3.0) / 100)
-
-            _mt_fake_sig = {
-                "symbol": mt_sym,
-                "entry":  _pround(_mt_use_entry),
-                "tp":     _pround(_mt_tp_use),
-                "sl":     _pround(_mt_sl_use),
-            }
-
-            with st.spinner(f"Placing order for {mt_sym}…"):
-                _mt_result = place_okx_order(_mt_fake_sig, _mt_cfg)
+            with st.spinner(f"Placing {'LIMIT' if mt_entry > 0 else 'MARKET'} order for {mt_sym}…"):
+                _mt_result = place_okx_manual_order(
+                    mt_sym, mt_entry, _mt_tp_use, _mt_sl_use, _mt_cfg)
 
             st.session_state["_mt_last_result"] = _mt_result
 
