@@ -314,6 +314,13 @@ if "_scanner_initialised" not in st.session_state:
         _b._bsc_filter_lock   = threading.Lock()
         _b._bsc_last_error    = ""
         _b._bsc_rescan_event  = threading.Event()   # set to skip sleep & rescan immediately
+        _b._bsc_api_conn_status = {          # result of last "Test Connection" call
+            "status":      "untested",       # "untested" | "ok" | "error"
+            "message":     "",
+            "tested_at":   None,             # Dubai ISO timestamp
+            "demo_mode":   None,
+            "uid":         "",               # OKX account UID on success
+        }
         # D — symbol cache (also stores ctVal per symbol for position sizing)
         _b._bsc_symbol_cache  = {"symbols": [], "fetched_at": 0, "wl_key": "", "ct_val": {}}
     st.session_state["_scanner_initialised"] = True
@@ -450,6 +457,52 @@ def _trade_post(path: str, body: dict, cfg: dict) -> dict:
                                data=body_str, timeout=20)
     r.raise_for_status()
     return r.json()
+
+def _trade_get(path: str, params: dict, cfg: dict) -> dict:
+    """Authenticated GET to an OKX private endpoint."""
+    qs  = ("?" + "&".join(f"{k}={v}" for k, v in params.items())) if params else ""
+    ts  = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    sign = _okx_sign(ts, "GET", path + qs, "", cfg["api_secret"])
+    headers = {
+        "OK-ACCESS-KEY":        cfg["api_key"],
+        "OK-ACCESS-SIGN":       sign,
+        "OK-ACCESS-TIMESTAMP":  ts,
+        "OK-ACCESS-PASSPHRASE": cfg["api_passphrase"],
+        "Content-Type":         "application/json",
+    }
+    if cfg.get("demo_mode", True):
+        headers["x-simulated-trading"] = "1"
+    with _api_sem:
+        r = get_session().get(f"{BASE}{path}", params=params,
+                              headers=headers, timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+def test_api_connection(cfg: dict) -> dict:
+    """
+    Verify OKX API credentials by calling GET /api/v5/account/balance.
+    Returns {"status":"ok"|"error", "message":str, "uid":str}.
+    """
+    if not cfg.get("api_key") or not cfg.get("api_secret") or not cfg.get("api_passphrase"):
+        return {"status": "error", "message": "API credentials are incomplete.", "uid": ""}
+    try:
+        # /api/v5/account/account-position-risk is lightweight; balance is more informative
+        resp = _trade_get("/api/v5/account/balance", {}, cfg)
+        if resp.get("code") != "0":
+            msg = f"OKX error {resp.get('code')}: {resp.get('msg', 'unknown')}"
+            return {"status": "error", "message": msg, "uid": ""}
+        # Extract total equity as a quick sanity display
+        details = resp.get("data", [{}])[0]
+        total_eq = details.get("totalEq", "—")
+        uid_resp  = _trade_get("/api/v5/account/config", {}, cfg)
+        uid = ""
+        if uid_resp.get("code") == "0":
+            uid = uid_resp.get("data", [{}])[0].get("uid", "")
+        env = "Demo" if cfg.get("demo_mode", True) else "Live"
+        msg = f"Connected ({env}) · Equity: {float(total_eq):.2f} USDT"
+        return {"status": "ok", "message": msg, "uid": uid}
+    except Exception as exc:
+        return {"status": "error", "message": str(exc), "uid": ""}
 
 def _get_ct_val(sym: str) -> float:
     """
@@ -1306,8 +1359,45 @@ with st.sidebar:
         st.caption(f"📐 Notional per trade: ~${notional_usdt:,.0f} USDT   "
                    f"| TP +${notional_usdt * _snap_cfg.get('tp_pct',1.5)/100:.2f}   "
                    f"| SL -${notional_usdt * _snap_cfg.get('sl_pct',3.0)/100:.2f}")
-        st.caption("🔒 API credentials are stored in scanner_config.json (plaintext). "
+        st.caption("🔒 Credentials stored in scanner_config.json. "
                    "Use a trade-only API key — never withdrawal permissions.")
+
+    # ── Connection test ────────────────────────────────────────────────────────
+    _conn = getattr(_b, "_bsc_api_conn_status",
+                    {"status": "untested", "message": "", "tested_at": None,
+                     "demo_mode": None, "uid": ""})
+    _has_creds = bool(_snap_cfg.get("api_key") and _snap_cfg.get("api_secret")
+                      and _snap_cfg.get("api_passphrase"))
+    if st.button("🔌 Test Connection", use_container_width=True,
+                 disabled=not _has_creds,
+                 help="Verify your API credentials against OKX right now."):
+        with st.spinner("Testing…"):
+            _result = test_api_connection(dict(_snap_cfg))
+        _b._bsc_api_conn_status = {
+            "status":    _result["status"],
+            "message":   _result["message"],
+            "tested_at": dubai_now().isoformat(),
+            "demo_mode": _snap_cfg.get("demo_mode", True),
+            "uid":       _result.get("uid", ""),
+        }
+        st.rerun()
+
+    # Show last test result
+    _conn_now = getattr(_b, "_bsc_api_conn_status",
+                        {"status": "untested", "message": "", "tested_at": None})
+    _conn_status = _conn_now.get("status", "untested")
+    if _conn_status == "ok":
+        st.success(f"🟢 {_conn_now['message']}")
+        if _conn_now.get("uid"):
+            st.caption(f"UID: {_conn_now['uid']}  ·  tested {fmt_dubai(_conn_now['tested_at'])}")
+    elif _conn_status == "error":
+        st.error(f"🔴 {_conn_now['message']}")
+        st.caption(f"Last tested: {fmt_dubai(_conn_now['tested_at'])}")
+    else:
+        if _has_creds:
+            st.caption("⚫ Not tested yet — click Test Connection")
+        else:
+            st.caption("⚫ Enter API credentials above to enable")
     st.divider()
 
     st.markdown("**📊 Trade Settings**")
@@ -1589,9 +1679,31 @@ if last_scan and last_scan != "never":
         last_scan = f"{ago}m ago  ({ts_dubai.strftime('%H:%M')} GST)"
     except Exception: pass
 
-col_h1, col_h2 = st.columns([3,1])
+col_h1, col_h2, col_h3 = st.columns([3, 1, 1])
 col_h1.caption(f"Last scan: {last_scan}   |   Auto-refresh every 30 s   |   🕐 Dubai / GST (UTC+4)")
 if col_h2.button("🔄 Refresh", key="manual_refresh"): st.rerun()
+
+# ── API connection status badge ───────────────────────────────────────────────
+_api_cs   = getattr(_b, "_bsc_api_conn_status",
+                    {"status": "untested", "message": "", "tested_at": None,
+                     "demo_mode": None, "uid": ""})
+_api_stat = _api_cs.get("status", "untested")
+_trade_on = _snap_cfg.get("trade_enabled", False)
+if not _trade_on:
+    _badge = "⚫ Auto-Trade: Off"
+    col_h3.caption(_badge)
+elif _api_stat == "ok":
+    _env_lbl = "Demo" if _api_cs.get("demo_mode") else "Live"
+    _badge   = f"🟢 API: {_env_lbl}"
+    col_h3.caption(_badge)
+elif _api_stat == "error":
+    col_h3.caption("🔴 API: Error")
+else:
+    col_h3.caption("🟡 API: Untested")
+
+if _trade_on and _api_stat == "ok":
+    _tested_str = fmt_dubai(_api_cs.get("tested_at", "")) if _api_cs.get("tested_at") else "—"
+    st.caption(f"🤖 Auto-Trading active · {_api_cs.get('message','')} · tested {_tested_str}")
 
 # ── Health metrics ─────────────────────────────────────────────────────────────
 open_count = sum(1 for s in signals if s["status"]=="open")
