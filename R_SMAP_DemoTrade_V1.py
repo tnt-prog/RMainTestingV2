@@ -678,21 +678,44 @@ def place_okx_order(sig: dict, cfg: dict) -> dict:
         ct_val = _get_ct_val(sym)
 
         notional  = usdt * lev
-        contracts = max(1, int(notional / (ct_val * entry)))
+        if ct_val <= 0 or entry <= 0:
+            return {"ordId": "", "algoId": "", "sz": 0, "status": "error",
+                    "error": f"Bad ct_val ({ct_val}) or entry ({entry}) — cannot size position"}
+        raw_contracts = notional / (ct_val * entry)
+        contracts     = max(1, int(raw_contracts))
+        # Guard against absurdly large values (e.g. micro-priced tokens with wrong ct_val)
+        if contracts > 100_000:
+            return {"ordId": "", "algoId": "", "sz": contracts, "status": "error",
+                    "error": (f"Contract count too large ({contracts}) — "
+                              f"ct_val={ct_val}, entry={entry}, notional={notional}. "
+                              f"Check ctVal for {sym}.")}
 
-        # ── Detect position mode from last connection test ────────────────────
-        # OKX Demo accounts default to "long_short_mode" (hedge mode).
-        # In hedge mode every order MUST include posSide, or OKX returns
-        # "All operations failed" (code 1) even for a clean market buy.
-        conn_status = getattr(_b, "_bsc_api_conn_status", {})
-        is_hedge    = conn_status.get("pos_mode", "net_mode") == "long_short_mode"
+        # ── Fetch position mode LIVE from OKX (not from cached conn status) ──
+        # Caching pos_mode is unreliable: builtins reset on process restart and
+        # the user may not click Test Connection before the first signal fires.
+        is_hedge = False
+        try:
+            _pm_resp = _trade_get("/api/v5/account/config", {}, cfg)
+            if _pm_resp.get("code") == "0":
+                _pm = _pm_resp.get("data", [{}])[0].get("posMode", "net_mode")
+                is_hedge = (_pm == "long_short_mode")
+                # Keep the UI conn status in sync too
+                _cs = getattr(_b, "_bsc_api_conn_status", None)
+                if _cs is not None:
+                    _cs["pos_mode"] = _pm
+        except Exception as _pm_exc:
+            # Fall back to whatever was last cached
+            is_hedge = (getattr(_b, "_bsc_api_conn_status", {})
+                        .get("pos_mode", "net_mode") == "long_short_mode")
+            _append_error("trade", f"posMode fetch failed: {_pm_exc}",
+                          symbol=sym, endpoint="/api/v5/account/config")
 
         # ── Step 1: Set leverage ──────────────────────────────────────────────
         try:
             _set_leverage_okx(sym, cfg)
         except Exception as lev_exc:
-            # Non-fatal — leverage may already be set; proceed with order
-            print(f"[Trade] set-leverage warning for {sym}: {lev_exc}")
+            _append_error("trade", f"set-leverage warning: {lev_exc}",
+                          symbol=sym, endpoint="/api/v5/account/set-leverage")
 
         # ── Step 2: Place clean market buy ───────────────────────────────────
         order_body: dict = {
@@ -720,13 +743,16 @@ def place_okx_order(sig: dict, cfg: dict) -> dict:
 
         if resp.get("code") != "0":
             err = _okx_err(resp)
-            _append_error("trade", f"Entry order failed: {err}",
+            _append_error("trade",
+                          f"{err} | body={json.dumps(order_body)} | resp={json.dumps(resp)[:300]}",
                           symbol=sym, endpoint="/api/v5/trade/order")
             return {"ordId": "", "algoId": "", "sz": contracts,
                     "status": "error", "error": err}
         if d0.get("sCode", "0") != "0":
             err = f"Entry order: {d0.get('sCode')}: {d0.get('sMsg','')}"
-            _append_error("trade", err, symbol=sym, endpoint="/api/v5/trade/order")
+            _append_error("trade",
+                          f"{err} | body={json.dumps(order_body)}",
+                          symbol=sym, endpoint="/api/v5/trade/order")
             return {"ordId": ord_id, "algoId": "", "sz": contracts,
                     "status": "error", "error": err}
 
@@ -1629,10 +1655,18 @@ with st.sidebar:
                                 {"instId": "BTC-USDT-SWAP", "ordId": _tordid}, _tc)
                 except Exception:
                     pass
-                st.success(f"✅ Test order placed & cancelled · ordId: {_tordid}")
+                st.session_state["_test_trade_result"] = ("ok", f"✅ Test order placed & cancelled · ordId: {_tordid}")
             else:
-                st.error(f"❌ {_okx_err(_tresp)}")
-        st.rerun()
+                _terr = _okx_err(_tresp)
+                _append_error("trade", f"Test trade failed: {_terr} | body={json.dumps(_tbody)} | resp={json.dumps(_tresp)[:300]}", endpoint="/api/v5/trade/order")
+                st.session_state["_test_trade_result"] = ("err", f"❌ {_terr}")
+
+    _ttr = st.session_state.get("_test_trade_result")
+    if _ttr:
+        if _ttr[0] == "ok":
+            st.success(_ttr[1])
+        else:
+            st.error(_ttr[1])
 
     # ── Raw response debug expander ───────────────────────────────────────────
     _raw = getattr(_b, "_bsc_last_trade_raw", {})
