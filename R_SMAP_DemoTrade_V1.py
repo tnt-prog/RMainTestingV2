@@ -627,7 +627,8 @@ _OKX_KNOWN_ERRORS = {
         "'Single-currency margin' (or higher), then re-test."
     ),
     "51000": "Parameter error — check instId, tdMode, or sz.",
-    "51001": "Instrument does not exist.",
+    "51001": ("Instrument doesn't exist on OKX — coin may be delisted. "
+              "Remove it from your watchlist."),
     "51006": "Order price out of limit.",
     "51008": "Insufficient balance.",
     "51020": "Order quantity below minimum.",
@@ -675,8 +676,21 @@ def place_okx_order(sig: dict, cfg: dict) -> dict:
         usdt   = float(cfg.get("trade_usdt_amount", 10))
         lev    = min(int(cfg.get("trade_leverage", 10)), get_max_leverage(sym))
         mode   = cfg.get("trade_margin_mode", "cross")
-        ct_val = _get_ct_val(sym)
 
+        # ── Pre-trade instrument validation ───────────────────────────────────
+        # A coin can appear in signals even after being delisted from OKX SWAP
+        # markets because historical candle data stays accessible. The ct_val
+        # cache is populated from the live instruments endpoint (state=live), so
+        # if a symbol is absent from that cache the SWAP instrument doesn't exist
+        # and OKX will return sCode 51001 (instrument not found).
+        ct_cache = _b._bsc_symbol_cache.get("ct_val", {})
+        if ct_cache and sym not in ct_cache:
+            err = (f"Instrument {_to_okx(sym)} not found in OKX live SWAP list — "
+                   f"may be delisted. Remove {sym} from watchlist.")
+            _append_error("trade", err, symbol=sym)
+            return {"ordId": "", "algoId": "", "sz": 0, "status": "error", "error": err}
+
+        ct_val = _get_ct_val(sym)
         notional  = usdt * lev
         if ct_val <= 0 or entry <= 0:
             return {"ordId": "", "algoId": "", "sz": 0, "status": "error",
@@ -1865,6 +1879,18 @@ with st.sidebar:
     st.markdown("**📋 Watchlist** (one symbol per line)")
     wl_text = st.text_area("wl", value="\n".join(_snap_cfg["watchlist"]),
                             height=180, label_visibility="collapsed", key="cfg_wl")
+
+    # Highlight any watchlist coins absent from the OKX live SWAP instrument list
+    _ct_cache = _b._bsc_symbol_cache.get("ct_val", {})
+    if _ct_cache:
+        _wl_delisted = [s for s in _snap_cfg.get("watchlist", [])
+                        if s not in _ct_cache]
+        if _wl_delisted:
+            st.warning(
+                f"⚠️ {len(_wl_delisted)} coin(s) not found as live OKX SWAP instruments "
+                f"(delisted or wrong ticker) — trades will be skipped for these:\n\n"
+                + ", ".join(_wl_delisted)
+            )
     st.divider()
 
     st.markdown("**🗑 Clear History**")
