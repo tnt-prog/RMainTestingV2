@@ -901,9 +901,12 @@ def place_okx_manual_order(sym: str, entry: float, tp: float, sl: float,
         except Exception as lev_exc:
             _append_error("trade", f"set-leverage warning: {lev_exc}", symbol=sym)
 
-        # ── Entry order ───────────────────────────────────────────────────────
+        # ── Build order body ──────────────────────────────────────────────────
+        # LIMIT: embed TP/SL via attachAlgoOrds in the same request.
+        #   OKX activates the algo when the limit order fills — no race condition.
+        # MARKET: two-step (entry → OCO), same as auto-trading.
         if entry > 0:
-            # LIMIT order at the user-specified price
+            # LIMIT order with TP/SL attached inline
             order_body: dict = {
                 "instId":  _to_okx(sym),
                 "tdMode":  mode,
@@ -911,9 +914,49 @@ def place_okx_manual_order(sym: str, entry: float, tp: float, sl: float,
                 "ordType": "limit",
                 "px":      str(_pround(entry)),
                 "sz":      str(contracts),
+                "attachAlgoOrds": [{
+                    "attachAlgoClOrdId": str(uuid.uuid4()).replace("-","")[:24],
+                    "tpTriggerPx":       str(_pround(tp)),
+                    "tpOrdPx":           "-1",
+                    "slTriggerPx":       str(_pround(sl)),
+                    "slOrdPx":           "-1",
+                }],
             }
+            if is_hedge:
+                order_body["posSide"] = "long"
+
+            resp   = _trade_post("/api/v5/trade/order", order_body, cfg)
+            _b._bsc_last_trade_raw = {
+                "endpoint":  "/api/v5/trade/order (LIMIT + attachAlgoOrds)",
+                "body_sent": order_body,
+                "response":  resp,
+                "is_hedge":  is_hedge,
+                "contracts": contracts,
+                "ct_val":    ct_val,
+            }
+            d0     = (resp.get("data") or [{}])[0]
+            ord_id = d0.get("ordId", "")
+
+            if resp.get("code") != "0":
+                err = _okx_err(resp)
+                _append_error("trade",
+                              f"{err} | body={json.dumps(order_body)} | resp={json.dumps(resp)[:300]}",
+                              symbol=sym, endpoint="/api/v5/trade/order")
+                return {"ordId": "", "algoId": "", "sz": contracts,
+                        "status": "error", "error": err}
+            if d0.get("sCode", "0") != "0":
+                err = f"Limit order: {d0.get('sCode')}: {d0.get('sMsg','')}"
+                _append_error("trade", f"{err} | body={json.dumps(order_body)}",
+                              symbol=sym, endpoint="/api/v5/trade/order")
+                return {"ordId": ord_id, "algoId": "", "sz": contracts,
+                        "status": "error", "error": err}
+
+            return {"ordId": ord_id, "algoId": "", "sz": contracts,
+                    "status": "placed", "error": "",
+                    "actual_entry": entry, "actual_tp": tp, "actual_sl": sl}
+
         else:
-            # MARKET order — fill at live price
+            # MARKET order — two-step: entry then OCO
             order_body = {
                 "instId":  _to_okx(sym),
                 "tdMode":  mode,
@@ -921,67 +964,69 @@ def place_okx_manual_order(sym: str, entry: float, tp: float, sl: float,
                 "ordType": "market",
                 "sz":      str(contracts),
             }
-        if is_hedge:
-            order_body["posSide"] = "long"
+            if is_hedge:
+                order_body["posSide"] = "long"
 
-        resp   = _trade_post("/api/v5/trade/order", order_body, cfg)
-        _b._bsc_last_trade_raw = {
-            "endpoint":  "/api/v5/trade/order",
-            "body_sent": order_body,
-            "response":  resp,
-            "is_hedge":  is_hedge,
-            "contracts": contracts,
-            "ct_val":    ct_val,
-        }
-        d0     = (resp.get("data") or [{}])[0]
-        ord_id = d0.get("ordId", "")
+            resp   = _trade_post("/api/v5/trade/order", order_body, cfg)
+            _b._bsc_last_trade_raw = {
+                "endpoint":  "/api/v5/trade/order (MARKET)",
+                "body_sent": order_body,
+                "response":  resp,
+                "is_hedge":  is_hedge,
+                "contracts": contracts,
+                "ct_val":    ct_val,
+            }
+            d0     = (resp.get("data") or [{}])[0]
+            ord_id = d0.get("ordId", "")
 
-        if resp.get("code") != "0":
-            err = _okx_err(resp)
-            _append_error("trade",
-                          f"{err} | body={json.dumps(order_body)} | resp={json.dumps(resp)[:300]}",
-                          symbol=sym, endpoint="/api/v5/trade/order")
-            return {"ordId": "", "algoId": "", "sz": contracts,
-                    "status": "error", "error": err}
-        if d0.get("sCode", "0") != "0":
-            err = f"Entry order: {d0.get('sCode')}: {d0.get('sMsg','')}"
-            _append_error("trade", f"{err} | body={json.dumps(order_body)}",
-                          symbol=sym, endpoint="/api/v5/trade/order")
-            return {"ordId": ord_id, "algoId": "", "sz": contracts,
-                    "status": "error", "error": err}
+            if resp.get("code") != "0":
+                err = _okx_err(resp)
+                _append_error("trade",
+                              f"{err} | body={json.dumps(order_body)} | resp={json.dumps(resp)[:300]}",
+                              symbol=sym, endpoint="/api/v5/trade/order")
+                return {"ordId": "", "algoId": "", "sz": contracts,
+                        "status": "error", "error": err}
+            if d0.get("sCode", "0") != "0":
+                err = f"Market order: {d0.get('sCode')}: {d0.get('sMsg','')}"
+                _append_error("trade", f"{err} | body={json.dumps(order_body)}",
+                              symbol=sym, endpoint="/api/v5/trade/order")
+                return {"ordId": ord_id, "algoId": "", "sz": contracts,
+                        "status": "error", "error": err}
 
-        # ── OCO algo with user-specified TP/SL (no recalculation) ─────────────
-        algo_body: dict = {
-            "instId":      _to_okx(sym),
-            "tdMode":      mode,
-            "side":        "sell",
-            "ordType":     "oco",
-            "sz":          str(contracts),
-            "tpTriggerPx": str(_pround(tp)),
-            "tpOrdPx":     "-1",
-            "slTriggerPx": str(_pround(sl)),
-            "slOrdPx":     "-1",
-        }
-        if is_hedge:
-            algo_body["posSide"] = "long"
+            # OCO with user-specified TP/SL (no recalculation for manual orders)
+            algo_body: dict = {
+                "instId":      _to_okx(sym),
+                "tdMode":      mode,
+                "side":        "sell",
+                "ordType":     "oco",
+                "sz":          str(contracts),
+                "tpTriggerPx": str(_pround(tp)),
+                "tpOrdPx":     "-1",
+                "slTriggerPx": str(_pround(sl)),
+                "slOrdPx":     "-1",
+            }
+            if is_hedge:
+                algo_body["posSide"] = "long"
 
-        algo_resp = _trade_post("/api/v5/trade/order-algo", algo_body, cfg)
-        ad        = (algo_resp.get("data") or [{}])[0]
-        algo_id   = ad.get("algoId", "")
+            algo_resp = _trade_post("/api/v5/trade/order-algo", algo_body, cfg)
+            _b._bsc_last_trade_raw["algo_body_sent"] = algo_body
+            _b._bsc_last_trade_raw["algo_response"]  = algo_resp
+            ad      = (algo_resp.get("data") or [{}])[0]
+            algo_id = ad.get("algoId", "")
 
-        if algo_resp.get("code") != "0" or (ad.get("sCode","0") != "0" and ad.get("sCode","")):
-            algo_err = _okx_err(algo_resp) if algo_resp.get("code") != "0" \
-                       else f"OCO: {ad.get('sCode')}: {ad.get('sMsg','')}"
-            _append_error("trade", f"OCO algo failed: {algo_err}",
-                          symbol=sym, endpoint="/api/v5/trade/order-algo")
-            return {"ordId": ord_id, "algoId": "", "sz": contracts,
-                    "status": "partial",
-                    "error": f"Entry ✅ · TP/SL ❌ {algo_err}",
-                    "actual_entry": entry, "actual_tp": tp, "actual_sl": sl}
+            if algo_resp.get("code") != "0" or (ad.get("sCode","0") != "0" and ad.get("sCode","")):
+                algo_err = _okx_err(algo_resp) if algo_resp.get("code") != "0" \
+                           else f"OCO: {ad.get('sCode')}: {ad.get('sMsg','')}"
+                _append_error("trade", f"OCO algo failed: {algo_err}",
+                              symbol=sym, endpoint="/api/v5/trade/order-algo")
+                return {"ordId": ord_id, "algoId": "", "sz": contracts,
+                        "status": "partial",
+                        "error": f"Entry ✅ · TP/SL ❌ {algo_err}",
+                        "actual_entry": 0, "actual_tp": tp, "actual_sl": sl}
 
-        return {"ordId": ord_id, "algoId": algo_id, "sz": contracts,
-                "status": "placed", "error": "",
-                "actual_entry": entry, "actual_tp": tp, "actual_sl": sl}
+            return {"ordId": ord_id, "algoId": algo_id, "sz": contracts,
+                    "status": "placed", "error": "",
+                    "actual_entry": 0, "actual_tp": tp, "actual_sl": sl}
 
     except Exception as exc:
         _append_error("trade", str(exc), symbol=sym, endpoint="/api/v5/trade/order")
@@ -2564,13 +2609,18 @@ with st.expander("🤖 Manual Trade", expanded=False):
             else:
                 st.error(f"❌ {_mt_err}")
 
-            # Show full raw OKX response
+            # Show full raw OKX request/response for debugging
             _mt_raw = getattr(_b, "_bsc_last_trade_raw", {})
             if _mt_raw:
-                st.markdown("**Request sent to OKX:**")
+                st.markdown(f"**Entry order — {_mt_raw.get('endpoint','')}**")
                 st.json(_mt_raw.get("body_sent", {}))
-                st.markdown("**OKX response:**")
+                st.markdown("**OKX entry response:**")
                 st.json(_mt_raw.get("response", {}))
+                if _mt_raw.get("algo_body_sent"):
+                    st.markdown("**OCO algo order sent:**")
+                    st.json(_mt_raw["algo_body_sent"])
+                    st.markdown("**OKX OCO response:**")
+                    st.json(_mt_raw.get("algo_response", {}))
                 st.caption(
                     f"is_hedge={_mt_raw.get('is_hedge')}  "
                     f"contracts={_mt_raw.get('contracts','?')}  "
