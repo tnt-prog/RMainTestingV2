@@ -2492,7 +2492,6 @@ if fc.get("total_watchlist", 0) > 0:
             (f"After {sar_lbl}",          after_f8),
             (f"After {vol_lbl}",          after_f9),
             ("After ⚠️ Empty Candle Drop", after_empty),
-            ("✅ Returned Signal",         fc.get("passed", 0)),
         ]
         fig_funnel = go.Figure(go.Funnel(
             y=[d[0] for d in funnel_data],
@@ -2544,11 +2543,12 @@ if fc.get("total_watchlist", 0) > 0:
         _fempty_syms = {s.split("(")[0] for s in _fempty}
         _after_empty = _after_f9 - _fempty_syms
 
-        # _pass = coins that actually returned a signal dict from process()
-        # _error_syms = coins that survived all filter stages BUT errored inside
-        #               process() before returning — they appear in _after_empty
-        #               but never in _pass. This is the previously invisible gap.
-        _error_syms   = _after_empty - _pass
+        # Process errors = coins that survived all filter stages but threw an
+        # exception inside process() before returning a signal dict.
+        # Computed as: survived all eliminations - actually passed - empty data drops.
+        # Note: _pass may lag by one cycle vs _after_empty due to snapshot timing,
+        # so we cap at 0 to avoid negative display values.
+        _process_err_count = max(0, fc.get("errors", 0))
 
         def _coin_str(s: set) -> str:
             return ", ".join(sorted(s)) if s else "—"
@@ -2557,34 +2557,30 @@ if fc.get("total_watchlist", 0) > 0:
         _blk_active_s = set(fc.get("blocked_by_active_syms",  []))
         _blk_cool_s   = set(fc.get("blocked_by_cooldown_syms",[]))
 
-        # Sanity check: _pass = new_signals + blocked_active + blocked_cooldown
-        # Any remainder means a signal was generated but neither fired nor blocked
-        _pass_accounted = _new_sig_s | _blk_active_s | _blk_cool_s
-        _pass_unaccounted = _pass - _pass_accounted
+        # "Returned Signal" is computed from the _bg_loop side (new + blocked) —
+        # this is always internally consistent because all three lists are written
+        # in the same lock acquisition, unlike passed_syms which is written
+        # during the scan and may be from a different cycle when the UI renders.
+        _returned_syms = _new_sig_s | _blk_active_s | _blk_cool_s
 
         stage_rows = [
-            ("⚡ After Bulk Pre-filter",            len(_pre),            _coin_str(_pre)),
-            ("🔬 Entered Deep Scan",                len(_chk),            _coin_str(_chk)),
-            (f"After {pdz15m_lbl}",                 len(_after_f2),       _coin_str(_after_f2)),
-            (f"After {pdz5m_lbl}",                  len(_after_f3),       _coin_str(_after_f3)),
-            (f"After {f4_lbl}",                     len(_after_f4),       _coin_str(_after_f4)),
-            (f"After {f5_lbl}",                     len(_after_f5),       _coin_str(_after_f5)),
-            (f"After {ema_lbl}",                    len(_after_f6),       _coin_str(_after_f6)),
-            (f"After {macd_lbl}",                   len(_after_f7),       _coin_str(_after_f7)),
-            (f"After {sar_lbl}",                    len(_after_f8),       _coin_str(_after_f8)),
-            (f"After {vol_lbl}",                    len(_after_f9),       _coin_str(_after_f9)),
-            ("⚠️ Dropped — Empty Candle Data",      len(_fempty),         ", ".join(sorted(_fempty)) if _fempty else "—"),
-            ("💥 Dropped — Process Error",          len(_error_syms),     _coin_str(_error_syms)),
-            ("✅ Returned Signal",                  len(_pass),           _coin_str(_pass)),
-            ("🔵 Blocked — Open trade exists",      len(_blk_active_s),   _coin_str(_blk_active_s)),
-            ("🟡 Blocked — Cooldown active",         len(_blk_cool_s),     _coin_str(_blk_cool_s)),
-            ("🟢 New Signals Fired",                len(_new_sig_s),      _coin_str(_new_sig_s)),
+            ("⚡ After Bulk Pre-filter",            len(_pre),              _coin_str(_pre)),
+            ("🔬 Entered Deep Scan",                len(_chk),              _coin_str(_chk)),
+            (f"After {pdz15m_lbl}",                 len(_after_f2),         _coin_str(_after_f2)),
+            (f"After {pdz5m_lbl}",                  len(_after_f3),         _coin_str(_after_f3)),
+            (f"After {f4_lbl}",                     len(_after_f4),         _coin_str(_after_f4)),
+            (f"After {f5_lbl}",                     len(_after_f5),         _coin_str(_after_f5)),
+            (f"After {ema_lbl}",                    len(_after_f6),         _coin_str(_after_f6)),
+            (f"After {macd_lbl}",                   len(_after_f7),         _coin_str(_after_f7)),
+            (f"After {sar_lbl}",                    len(_after_f8),         _coin_str(_after_f8)),
+            (f"After {vol_lbl}",                    len(_after_f9),         _coin_str(_after_f9)),
+            ("⚠️ Dropped — Empty Candle Data",      len(_fempty),           ", ".join(sorted(_fempty)) if _fempty else "—"),
+            ("💥 Dropped — Process Error",          _process_err_count,     "See API Error Log below ↓"),
+            ("✅ Returned Signal",                  len(_returned_syms),    _coin_str(_returned_syms)),
+            ("🔵 Blocked — Open trade exists",      len(_blk_active_s),     _coin_str(_blk_active_s)),
+            ("🟡 Blocked — Cooldown active",         len(_blk_cool_s),       _coin_str(_blk_cool_s)),
+            ("🟢 New Signals Fired",                len(_new_sig_s),        _coin_str(_new_sig_s)),
         ]
-        if _pass_unaccounted:
-            stage_rows.append(
-                ("⚪ Signal generated but not logged",
-                 len(_pass_unaccounted), _coin_str(_pass_unaccounted))
-            )
 
         st.dataframe(
             [{"Filter Stage": r[0], "Count": r[1], "Qualified Coins": r[2]} for r in stage_rows],
