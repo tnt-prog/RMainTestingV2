@@ -320,6 +320,7 @@ if "_scanner_initialised" not in st.session_state:
             "tested_at":   None,             # Dubai ISO timestamp
             "demo_mode":   None,
             "uid":         "",               # OKX account UID on success
+            "pos_mode":    "net_mode",       # "net_mode" | "long_short_mode" (hedge)
         }
         # D — symbol cache (also stores ctVal per symbol for position sizing)
         _b._bsc_symbol_cache  = {"symbols": [], "fetched_at": 0, "wl_key": "", "ct_val": {}}
@@ -480,29 +481,48 @@ def _trade_get(path: str, params: dict, cfg: dict) -> dict:
 
 def test_api_connection(cfg: dict) -> dict:
     """
-    Verify OKX API credentials by calling GET /api/v5/account/balance.
-    Returns {"status":"ok"|"error", "message":str, "uid":str}.
+    Verify OKX API credentials by calling GET /api/v5/account/balance and
+    GET /api/v5/account/config.
+
+    Also detects the account's position mode (net_mode vs long_short_mode) which
+    controls whether posSide must be included in trade orders.
+
+    Returns {"status":"ok"|"error", "message":str, "uid":str, "pos_mode":str}.
     """
     if not cfg.get("api_key") or not cfg.get("api_secret") or not cfg.get("api_passphrase"):
-        return {"status": "error", "message": "API credentials are incomplete.", "uid": ""}
+        return {"status": "error", "message": "API credentials are incomplete.",
+                "uid": "", "pos_mode": "net_mode"}
     try:
-        # /api/v5/account/account-position-risk is lightweight; balance is more informative
+        # 1 — balance check
         resp = _trade_get("/api/v5/account/balance", {}, cfg)
         if resp.get("code") != "0":
             msg = f"OKX error {resp.get('code')}: {resp.get('msg', 'unknown')}"
-            return {"status": "error", "message": msg, "uid": ""}
-        # Extract total equity as a quick sanity display
-        details = resp.get("data", [{}])[0]
-        total_eq = details.get("totalEq", "—")
-        uid_resp  = _trade_get("/api/v5/account/config", {}, cfg)
-        uid = ""
-        if uid_resp.get("code") == "0":
-            uid = uid_resp.get("data", [{}])[0].get("uid", "")
-        env = "Demo" if cfg.get("demo_mode", True) else "Live"
-        msg = f"Connected ({env}) · Equity: {float(total_eq):.2f} USDT"
-        return {"status": "ok", "message": msg, "uid": uid}
+            return {"status": "error", "message": msg, "uid": "", "pos_mode": "net_mode"}
+
+        details  = resp.get("data", [{}])[0]
+        total_eq = details.get("totalEq", "0")
+
+        # 2 — account config: UID + position mode
+        cfg_resp = _trade_get("/api/v5/account/config", {}, cfg)
+        uid      = ""
+        pos_mode = "net_mode"
+        if cfg_resp.get("code") == "0":
+            acct     = cfg_resp.get("data", [{}])[0]
+            uid      = acct.get("uid", "")
+            pos_mode = acct.get("posMode", "net_mode")
+            # OKX returns "long_short_mode" or "net_mode"
+
+        env      = "Demo" if cfg.get("demo_mode", True) else "Live"
+        pm_label = "Hedge (Long/Short)" if pos_mode == "long_short_mode" else "Net"
+        try:
+            eq_str = f"{float(total_eq):,.2f}"
+        except (ValueError, TypeError):
+            eq_str = total_eq
+        msg = f"Connected ({env}) · Equity: {eq_str} USDT · Position mode: {pm_label}"
+        return {"status": "ok", "message": msg, "uid": uid, "pos_mode": pos_mode}
+
     except Exception as exc:
-        return {"status": "error", "message": str(exc), "uid": ""}
+        return {"status": "error", "message": str(exc), "uid": "", "pos_mode": "net_mode"}
 
 def _get_ct_val(sym: str) -> float:
     """
@@ -575,6 +595,13 @@ def place_okx_order(sig: dict, cfg: dict) -> dict:
         notional  = usdt * lev
         contracts = max(1, int(notional / (ct_val * entry)))
 
+        # ── Detect position mode from last connection test ────────────────────
+        # OKX Demo accounts default to "long_short_mode" (hedge mode).
+        # In hedge mode every order MUST include posSide, or OKX returns
+        # "All operations failed" (code 1) even for a clean market buy.
+        conn_status = getattr(_b, "_bsc_api_conn_status", {})
+        is_hedge    = conn_status.get("pos_mode", "net_mode") == "long_short_mode"
+
         # ── Step 1: Set leverage ──────────────────────────────────────────────
         try:
             _set_leverage_okx(sym, cfg)
@@ -582,14 +609,17 @@ def place_okx_order(sig: dict, cfg: dict) -> dict:
             # Non-fatal — leverage may already be set; proceed with order
             print(f"[Trade] set-leverage warning for {sym}: {lev_exc}")
 
-        # ── Step 2: Place clean market buy (no attachAlgoOrds) ───────────────
-        order_body = {
+        # ── Step 2: Place clean market buy ───────────────────────────────────
+        order_body: dict = {
             "instId":  _to_okx(sym),
             "tdMode":  mode,
             "side":    "buy",
             "ordType": "market",
             "sz":      str(contracts),
         }
+        if is_hedge:
+            order_body["posSide"] = "long"   # required in Long/Short (hedge) mode
+
         resp   = _trade_post("/api/v5/trade/order", order_body, cfg)
         d0     = (resp.get("data") or [{}])[0]
         ord_id = d0.get("ordId", "")
@@ -603,9 +633,8 @@ def place_okx_order(sig: dict, cfg: dict) -> dict:
                     "error": f"Entry order: {d0.get('sCode')}: {d0.get('sMsg','')}"}
 
         # ── Step 3: Place OCO algo (TP + SL) as a separate call ─────────────
-        # side="sell" closes the long; ordType="oco" bundles TP and SL together.
-        # If the account uses hedge mode the user should add posSide="long" here.
-        algo_body = {
+        # In hedge mode, closing a long requires posSide="long" on the sell too.
+        algo_body: dict = {
             "instId":       _to_okx(sym),
             "tdMode":       mode,
             "side":         "sell",
@@ -616,6 +645,8 @@ def place_okx_order(sig: dict, cfg: dict) -> dict:
             "slTriggerPx":  str(_pround(sl)),
             "slOrdPx":      "-1",    # market fill when SL triggers
         }
+        if is_hedge:
+            algo_body["posSide"] = "long"    # closing a long in hedge mode
         algo_resp = _trade_post("/api/v5/trade/order-algo", algo_body, cfg)
         ad        = (algo_resp.get("data") or [{}])[0]
         algo_id   = ad.get("algoId", "")
@@ -1326,7 +1357,7 @@ def _ensure_scanner():
 # ─────────────────────────────────────────────────────────────────────────────
 # STREAMLIT UI
 # ─────────────────────────────────────────────────────────────────────────────
-st.set_page_config(page_title="Crypto SMC Scanner", page_icon="🔍",
+st.set_page_config(page_title="Crypto Demo Trades", page_icon="🔍",
                    layout="wide", initial_sidebar_state="expanded")
 _ensure_scanner()
 
@@ -1420,6 +1451,7 @@ with st.sidebar:
             "tested_at": dubai_now().isoformat(),
             "demo_mode": _snap_cfg.get("demo_mode", True),
             "uid":       _result.get("uid", ""),
+            "pos_mode":  _result.get("pos_mode", "net_mode"),
         }
         st.rerun()
 
@@ -1439,6 +1471,14 @@ with st.sidebar:
             st.caption("⚫ Not tested yet — click Test Connection")
         else:
             st.caption("⚫ Enter API credentials above to enable")
+
+    # Show detected position mode (critical for order placement)
+    if _conn_status == "ok":
+        _pm = _conn_now.get("pos_mode", "net_mode")
+        if _pm == "long_short_mode":
+            st.info("📐 Position mode: **Hedge (Long/Short)** — `posSide: long` will be added to all orders automatically.")
+        else:
+            st.info("📐 Position mode: **Net** — standard order placement.")
     st.divider()
 
     st.markdown("**📊 Trade Settings**")
@@ -1709,7 +1749,7 @@ with st.sidebar:
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN AREA
 # ─────────────────────────────────────────────────────────────────────────────
-st.title("🔍 Crypto SMC Scanner")
+st.title("🔍 Crypto Demo Trades")
 
 last_scan = health.get("last_scan_at", "never")
 if last_scan and last_scan != "never":
