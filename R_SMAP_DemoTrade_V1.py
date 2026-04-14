@@ -534,16 +534,33 @@ def _set_leverage_okx(sym: str, cfg: dict) -> None:
         "mgnMode": cfg.get("trade_margin_mode", "cross"),
     }, cfg)
 
+def _okx_err(resp: dict) -> str:
+    """Extract the most specific error string from an OKX response dict."""
+    top   = f"OKX {resp.get('code','?')}: {resp.get('msg','unknown')}"
+    items = resp.get("data") or []
+    if items:
+        d = items[0]
+        s_code, s_msg = d.get("sCode", ""), d.get("sMsg", "")
+        if s_msg and s_code not in ("", "0"):
+            return f"{top}  [{s_code}: {s_msg}]"
+    return top
+
 def place_okx_order(sig: dict, cfg: dict) -> dict:
     """
-    Place a market LONG order on OKX (demo or live) with attached TP/SL algo orders.
+    Place a market LONG order on OKX (demo or live), then immediately place a
+    separate OCO algo order (TP + SL in one call) via /api/v5/trade/order-algo.
+
+    Two-step design avoids the 'All operations failed' error that occurs when
+    attachAlgoOrds in the entry order fails validation on the exchange side.
 
     Position sizing:
         notional   = trade_usdt_amount × leverage
         contracts  = floor(notional / (ctVal × entry_price))   ← minimum 1
 
     Returns a result dict:
-        {"ordId": str, "sz": int, "status": "placed"|"error", "error": str}
+        {"ordId": str, "algoId": str, "sz": int,
+         "status": "placed"|"partial"|"error", "error": str}
+        status="partial" means the entry order placed but the OCO algo failed.
     """
     try:
         sym    = sig["symbol"]
@@ -558,41 +575,64 @@ def place_okx_order(sig: dict, cfg: dict) -> dict:
         notional  = usdt * lev
         contracts = max(1, int(notional / (ct_val * entry)))
 
-        # 1. Set leverage (OKX requires this before opening a new position)
-        _set_leverage_okx(sym, cfg)
+        # ── Step 1: Set leverage ──────────────────────────────────────────────
+        try:
+            _set_leverage_okx(sym, cfg)
+        except Exception as lev_exc:
+            # Non-fatal — leverage may already be set; proceed with order
+            print(f"[Trade] set-leverage warning for {sym}: {lev_exc}")
 
-        # 2. Place market order with attached TP/SL
+        # ── Step 2: Place clean market buy (no attachAlgoOrds) ───────────────
         order_body = {
             "instId":  _to_okx(sym),
             "tdMode":  mode,
             "side":    "buy",
             "ordType": "market",
             "sz":      str(contracts),
-            "attachAlgoOrds": [{
-                "attachAlgoClOrdId": str(uuid.uuid4()).replace("-", "")[:24],
-                "tpTriggerPx":       str(_pround(tp)),
-                "tpOrdPx":           "-1",    # market fill on TP trigger
-                "slTriggerPx":       str(_pround(sl)),
-                "slOrdPx":           "-1",    # market fill on SL trigger
-            }],
         }
-        resp = _trade_post("/api/v5/trade/order", order_body, cfg)
+        resp   = _trade_post("/api/v5/trade/order", order_body, cfg)
+        d0     = (resp.get("data") or [{}])[0]
+        ord_id = d0.get("ordId", "")
 
-        # OKX returns code "0" for success
         if resp.get("code") != "0":
-            err = f"OKX {resp.get('code')}: {resp.get('msg','unknown error')}"
-            return {"ordId": "", "sz": contracts, "status": "error", "error": err}
+            return {"ordId": "", "algoId": "", "sz": contracts,
+                    "status": "error", "error": _okx_err(resp)}
+        if d0.get("sCode", "0") != "0":
+            return {"ordId": ord_id, "algoId": "", "sz": contracts,
+                    "status": "error",
+                    "error": f"Entry order: {d0.get('sCode')}: {d0.get('sMsg','')}"}
 
-        data  = resp.get("data", [{}])[0]
-        ord_id = data.get("ordId", "")
-        if data.get("sCode", "0") != "0":
-            err = f"Order {data.get('sCode')}: {data.get('sMsg','')}"
-            return {"ordId": ord_id, "sz": contracts, "status": "error", "error": err}
+        # ── Step 3: Place OCO algo (TP + SL) as a separate call ─────────────
+        # side="sell" closes the long; ordType="oco" bundles TP and SL together.
+        # If the account uses hedge mode the user should add posSide="long" here.
+        algo_body = {
+            "instId":       _to_okx(sym),
+            "tdMode":       mode,
+            "side":         "sell",
+            "ordType":      "oco",
+            "sz":           str(contracts),
+            "tpTriggerPx":  str(_pround(tp)),
+            "tpOrdPx":      "-1",    # market fill when TP triggers
+            "slTriggerPx":  str(_pround(sl)),
+            "slOrdPx":      "-1",    # market fill when SL triggers
+        }
+        algo_resp = _trade_post("/api/v5/trade/order-algo", algo_body, cfg)
+        ad        = (algo_resp.get("data") or [{}])[0]
+        algo_id   = ad.get("algoId", "")
 
-        return {"ordId": ord_id, "sz": contracts, "status": "placed", "error": ""}
+        if algo_resp.get("code") != "0" or (ad.get("sCode","0") != "0" and ad.get("sCode","")):
+            algo_err = _okx_err(algo_resp) if algo_resp.get("code") != "0" \
+                       else f"OCO algo: {ad.get('sCode')}: {ad.get('sMsg','')}"
+            # Entry is placed — mark as partial so the user knows
+            return {"ordId": ord_id, "algoId": "", "sz": contracts,
+                    "status": "partial", "error": f"Entry ✅ · TP/SL ❌ {algo_err}"}
+
+        return {"ordId": ord_id, "algoId": algo_id, "sz": contracts,
+                "status": "placed", "error": ""}
 
     except Exception as exc:
-        return {"ordId": "", "sz": 0, "status": "error", "error": str(exc)}
+        return {"ordId": "", "algoId": "", "sz": 0,
+                "status": "error", "error": str(exc)}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # A — Bulk ticker fetch + pre-filter (single API call)
@@ -1260,6 +1300,7 @@ def _bg_loop():
                 for sig in sigs_to_trade:
                     result = place_okx_order(sig, cfg)
                     sig["order_id"]     = result.get("ordId", "")
+                    sig["algo_id"]      = result.get("algoId", "")
                     sig["order_sz"]     = result.get("sz", 0)
                     sig["order_status"] = result.get("status", "")
                     sig["order_error"]  = result.get("error", "")
@@ -1810,14 +1851,16 @@ if filtered_sorted:
             tp_usd_str = sl_usd_str = "—"
         # ── Order info (auto-trading) ─────────────────────────────────────────
         ord_id_str  = s.get("order_id", "") or "—"
-        ord_env     = ("🟡 Demo" if s.get("demo_mode") else "🔴 Live") \
-                      if s.get("order_status") == "placed" else ""
+        algo_id_str = s.get("algo_id",  "") or "—"
+        ord_env     = "🟡 Demo" if s.get("demo_mode") else "🔴 Live"
         ord_status  = s.get("order_status", "")
         ord_err     = s.get("order_error", "")
         if ord_status == "placed":
-            ord_status_str = f"✅ Placed {ord_env}"
+            ord_status_str = f"✅ Entry+OCO {ord_env}"
+        elif ord_status == "partial":
+            ord_status_str = f"⚠️ Entry only {ord_env} · {ord_err[:80]}"
         elif ord_status == "error":
-            ord_status_str = f"❌ {ord_err[:60]}" if ord_err else "❌ Error"
+            ord_status_str = f"❌ {ord_err[:80]}" if ord_err else "❌ Error"
         else:
             ord_status_str = "—"
         # ── Duration: time from signal entry → TP/SL close ───────────────────
@@ -1856,6 +1899,7 @@ if filtered_sorted:
             "Max Lev":        f"{max_lev}×",
             "Order":          ord_status_str,
             "Order ID":       ord_id_str,
+            "Algo ID":        algo_id_str,
             "Entry Criteria": crit_str,
             "⚠️ SL Reason":  sl_reason,
         })
@@ -1872,6 +1916,7 @@ if filtered_sorted:
                      "Max Lev":        st.column_config.TextColumn(width="small"),
                      "Order":          st.column_config.TextColumn(width="medium"),
                      "Order ID":       st.column_config.TextColumn(width="medium"),
+                     "Algo ID":        st.column_config.TextColumn(width="medium"),
                      "Entry Criteria": st.column_config.TextColumn(width="medium"),
                      "⚠️ SL Reason":  st.column_config.TextColumn(width="medium"),
                  })
