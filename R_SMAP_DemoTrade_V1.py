@@ -321,6 +321,7 @@ if "_scanner_initialised" not in st.session_state:
             "demo_mode":   None,
             "uid":         "",               # OKX account UID on success
             "pos_mode":    "net_mode",       # "net_mode" | "long_short_mode" (hedge)
+            "acct_lv":     "2",              # OKX account level (1=Simple, 2=Single-margin…)
         }
         _b._bsc_last_trade_raw  = {}         # full raw OKX response from last order attempt
         # D — symbol cache (also stores ctVal per symbol for position sizing)
@@ -507,11 +508,21 @@ def test_api_connection(cfg: dict) -> dict:
         cfg_resp = _trade_get("/api/v5/account/config", {}, cfg)
         uid      = ""
         pos_mode = "net_mode"
+        acct_lv  = "2"   # assume single-currency margin if unknown
         if cfg_resp.get("code") == "0":
             acct     = cfg_resp.get("data", [{}])[0]
             uid      = acct.get("uid", "")
             pos_mode = acct.get("posMode", "net_mode")
-            # OKX returns "long_short_mode" or "net_mode"
+            acct_lv  = str(acct.get("acctLv", "2"))
+
+        # acctLv "1" = Simple mode — SWAP trading not allowed
+        _ACCT_MODE_LABELS = {
+            "1": "Simple (⚠️ SWAP disabled)",
+            "2": "Single-currency margin",
+            "3": "Multi-currency margin",
+            "4": "Portfolio margin",
+        }
+        acct_lv_label = _ACCT_MODE_LABELS.get(acct_lv, f"Level {acct_lv}")
 
         env      = "Demo" if cfg.get("demo_mode", True) else "Live"
         pm_label = "Hedge (Long/Short)" if pos_mode == "long_short_mode" else "Net"
@@ -519,8 +530,24 @@ def test_api_connection(cfg: dict) -> dict:
             eq_str = f"{float(total_eq):,.2f}"
         except (ValueError, TypeError):
             eq_str = total_eq
-        msg = f"Connected ({env}) · Equity: {eq_str} USDT · Position mode: {pm_label}"
-        return {"status": "ok", "message": msg, "uid": uid, "pos_mode": pos_mode}
+
+        if acct_lv == "1":
+            # Connected but cannot trade — return as error with clear instructions
+            msg = (
+                f"Connected ({env}) but account is in Simple mode — "
+                "SWAP trading is disabled.\n\n"
+                "Fix: OKX Demo → avatar (top-right) → Account mode → "
+                "switch to 'Single-currency margin' or higher."
+            )
+            return {"status": "error", "message": msg, "uid": uid,
+                    "pos_mode": pos_mode, "acct_lv": acct_lv}
+
+        msg = (
+            f"Connected ({env}) · {acct_lv_label} · "
+            f"Equity: {eq_str} USDT · Pos mode: {pm_label}"
+        )
+        return {"status": "ok", "message": msg, "uid": uid,
+                "pos_mode": pos_mode, "acct_lv": acct_lv}
 
     except Exception as exc:
         return {"status": "error", "message": str(exc), "uid": "", "pos_mode": "net_mode"}
@@ -555,15 +582,34 @@ def _set_leverage_okx(sym: str, cfg: dict) -> None:
         "mgnMode": cfg.get("trade_margin_mode", "cross"),
     }, cfg)
 
+_OKX_KNOWN_ERRORS = {
+    "51010": (
+        "Account is in Simple mode — SWAP trading is disabled. "
+        "Fix: OKX Demo → top-right avatar → Account mode → switch to "
+        "'Single-currency margin' (or higher), then re-test."
+    ),
+    "51000": "Parameter error — check instId, tdMode, or sz.",
+    "51001": "Instrument does not exist.",
+    "51006": "Order price out of limit.",
+    "51008": "Insufficient balance.",
+    "51020": "Order quantity below minimum.",
+    "58001": "Invalid API key — check credentials.",
+    "50111": "Invalid API key.",
+    "50100": "API frozen — IP or permissions issue.",
+}
+
 def _okx_err(resp: dict) -> str:
     """Extract the most specific error string from an OKX response dict."""
     top   = f"OKX {resp.get('code','?')}: {resp.get('msg','unknown')}"
     items = resp.get("data") or []
     if items:
         d = items[0]
-        s_code, s_msg = d.get("sCode", ""), d.get("sMsg", "")
-        if s_msg and s_code not in ("", "0"):
-            return f"{top}  [{s_code}: {s_msg}]"
+        s_code = d.get("sCode", "")
+        s_msg  = d.get("sMsg", "").strip()
+        if s_code and s_code not in ("", "0"):
+            friendly = _OKX_KNOWN_ERRORS.get(s_code)
+            detail   = friendly if friendly else (s_msg or s_code)
+            return f"[{s_code}] {detail}"
     return top
 
 def place_okx_order(sig: dict, cfg: dict) -> dict:
@@ -1462,6 +1508,7 @@ with st.sidebar:
             "demo_mode": _snap_cfg.get("demo_mode", True),
             "uid":       _result.get("uid", ""),
             "pos_mode":  _result.get("pos_mode", "net_mode"),
+            "acct_lv":   _result.get("acct_lv", "2"),
         }
         st.rerun()
 
