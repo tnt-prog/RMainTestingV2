@@ -2239,6 +2239,131 @@ if filtered_sorted:
 else:
     st.info("No signals yet — scanner runs every few minutes.")
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Manual Trade Panel
+# ─────────────────────────────────────────────────────────────────────────────
+_mt_has_creds = bool(
+    _snap_cfg.get("api_key") and _snap_cfg.get("api_secret")
+    and _snap_cfg.get("api_passphrase") and _snap_cfg.get("trade_enabled")
+)
+
+with st.expander("🤖 Manual Trade", expanded=False):
+    if not _mt_has_creds:
+        st.warning("Enable Auto-Trading and enter API credentials in the sidebar first.")
+    else:
+        st.caption("Place a trade manually on any coin. Use this to debug order errors — "
+                   "the full OKX request and response are shown immediately below.")
+
+        # ── Coin selector ─────────────────────────────────────────────────────
+        # Pre-populate with open signals that have no order yet (or any signal)
+        _sig_syms  = [s["symbol"] for s in signals if s.get("status") == "open"]
+        _wl_syms   = _snap_cfg.get("watchlist", [])
+        _all_syms  = sorted(set(_sig_syms + _wl_syms))
+        _mt_default = _sig_syms[0] if _sig_syms else (_all_syms[0] if _all_syms else "BTCUSDT")
+
+        mt_col1, mt_col2 = st.columns([2, 1])
+        mt_sym = mt_col1.selectbox(
+            "Symbol", _all_syms,
+            index=_all_syms.index(_mt_default) if _mt_default in _all_syms else 0,
+            key="mt_sym")
+        mt_mode = mt_col2.selectbox(
+            "Margin mode", ["cross", "isolated"],
+            index=0 if _snap_cfg.get("trade_margin_mode","cross") == "cross" else 1,
+            key="mt_mode")
+
+        # ── Auto-fill from existing open signal if available ──────────────────
+        _mt_sig = next((s for s in signals
+                        if s["symbol"] == mt_sym and s["status"] == "open"), None)
+        _mt_entry_def = float(_mt_sig["entry"]) if _mt_sig else 0.0
+        _mt_tp_def    = float(_mt_sig["tp"])    if _mt_sig else 0.0
+        _mt_sl_def    = float(_mt_sig["sl"])    if _mt_sig else 0.0
+
+        mc1, mc2, mc3 = st.columns(3)
+        mt_entry = mc1.number_input("Entry price (0 = live market)",
+                                    min_value=0.0, value=_mt_entry_def,
+                                    format="%.8f", key="mt_entry")
+        mt_tp    = mc2.number_input("TP price",
+                                    min_value=0.0, value=_mt_tp_def,
+                                    format="%.8f", key="mt_tp")
+        mt_sl    = mc3.number_input("SL price",
+                                    min_value=0.0, value=_mt_sl_def,
+                                    format="%.8f", key="mt_sl")
+
+        md1, md2 = st.columns(2)
+        mt_usdt = md1.number_input("Size (USDT collateral)",
+                                   min_value=1.0, value=float(_snap_cfg.get("trade_usdt_amount", 10)),
+                                   key="mt_usdt")
+        mt_lev  = md2.number_input("Leverage ×",
+                                   min_value=1, max_value=125,
+                                   value=int(_snap_cfg.get("trade_leverage", 10)),
+                                   key="mt_lev")
+
+        if _mt_sig:
+            st.caption(f"ℹ️ Pre-filled from open signal for {mt_sym} "
+                       f"(entry {_mt_entry_def}, TP {_mt_tp_def}, SL {_mt_sl_def})")
+
+        if st.button("🚀 Place Manual Trade", type="primary", key="mt_place"):
+            # Build a synthetic signal dict the same shape as a real one
+            _mt_cfg = dict(_snap_cfg)
+            _mt_cfg["trade_usdt_amount"] = mt_usdt
+            _mt_cfg["trade_leverage"]    = mt_lev
+            _mt_cfg["trade_margin_mode"] = mt_mode
+
+            # If entry is 0, fetch the current market price
+            _mt_use_entry = mt_entry
+            if _mt_use_entry <= 0:
+                try:
+                    _mt_ticker = safe_get(
+                        f"{BASE}/api/v5/market/ticker",
+                        {"instId": _to_okx(mt_sym)})
+                    _mt_use_entry = float(
+                        _mt_ticker.get("data", [{}])[0].get("last", 0))
+                    st.info(f"Live price fetched: {_mt_use_entry}")
+                except Exception as _mte:
+                    st.error(f"Could not fetch live price: {_mte}")
+                    st.stop()
+
+            _mt_tp_use = mt_tp if mt_tp > 0 else _mt_use_entry * (1 + _snap_cfg.get("tp_pct", 1.5) / 100)
+            _mt_sl_use = mt_sl if mt_sl > 0 else _mt_use_entry * (1 - _snap_cfg.get("sl_pct", 3.0) / 100)
+
+            _mt_fake_sig = {
+                "symbol": mt_sym,
+                "entry":  _pround(_mt_use_entry),
+                "tp":     _pround(_mt_tp_use),
+                "sl":     _pround(_mt_sl_use),
+            }
+
+            with st.spinner(f"Placing order for {mt_sym}…"):
+                _mt_result = place_okx_order(_mt_fake_sig, _mt_cfg)
+
+            st.session_state["_mt_last_result"] = _mt_result
+
+        # ── Show last manual trade result ─────────────────────────────────────
+        _mt_res = st.session_state.get("_mt_last_result")
+        if _mt_res:
+            _mt_status = _mt_res.get("status", "")
+            _mt_err    = _mt_res.get("error", "")
+            if _mt_status == "placed":
+                st.success(f"✅ Placed · Order ID: {_mt_res.get('ordId')} "
+                           f"· Algo ID: {_mt_res.get('algoId')} "
+                           f"· Contracts: {_mt_res.get('sz')}")
+            elif _mt_status == "partial":
+                st.warning(f"⚠️ {_mt_err}")
+            else:
+                st.error(f"❌ {_mt_err}")
+
+            # Show full raw OKX response
+            _mt_raw = getattr(_b, "_bsc_last_trade_raw", {})
+            if _mt_raw:
+                st.markdown("**Request sent to OKX:**")
+                st.json(_mt_raw.get("body_sent", {}))
+                st.markdown("**OKX response:**")
+                st.json(_mt_raw.get("response", {}))
+                st.caption(
+                    f"is_hedge={_mt_raw.get('is_hedge')}  "
+                    f"contracts={_mt_raw.get('contracts','?')}  "
+                    f"ct_val={_mt_raw.get('ct_val','?')}")
+
 # ── Charts ─────────────────────────────────────────────────────────────────────
 if signals:
     st.divider()
