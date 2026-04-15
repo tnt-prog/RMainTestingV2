@@ -248,10 +248,30 @@ def init_db():
             id INTEGER PRIMARY KEY, config_json TEXT
         );
     """
+    # ── Validate secrets are configured ──────────────────────────────────────
+    if "supabase" not in st.secrets or "db_url" not in st.secrets["supabase"]:
+        raise RuntimeError(
+            "Supabase credentials missing from secrets. "
+            "Add [supabase] db_url to your Streamlit Cloud secrets or "
+            ".streamlit/secrets.toml for local use.")
+
     db_url = st.secrets["supabase"]["db_url"]
-    conn   = psycopg2.connect(db_url, connect_timeout=15)
-    conn.autocommit = False
-    return conn
+
+    # ── Ensure SSL is set — Supabase requires it ──────────────────────────────
+    if "sslmode" not in db_url:
+        separator = "&" if "?" in db_url else "?"
+        db_url   += f"{separator}sslmode=require"
+
+    try:
+        conn = psycopg2.connect(db_url, connect_timeout=15)
+        conn.autocommit = False
+        return conn
+    except psycopg2.OperationalError as e:
+        raise RuntimeError(
+            f"Could not connect to Supabase: {e}\n\n"
+            "Check: 1) Secrets are saved in Streamlit Cloud dashboard  "
+            "2) URL uses port 6543 (Pooler, not 5432 direct)  "
+            "3) Password is correct") from e
 
 def load_config() -> dict:
     try:
@@ -417,7 +437,16 @@ if "_scanner_initialised" not in st.session_state:
     if not getattr(builtins, "_binance_scanner_globals_set", False):
         import builtins as _b
         _b._binance_scanner_globals_set = True
-        _b._bsc_db_conn = init_db()   # open Supabase connection first
+        # Open Supabase connection — show a clear error if it fails
+        # instead of a cryptic Python traceback
+        try:
+            _b._bsc_db_conn = init_db()
+        except RuntimeError as _db_err:
+            st.error(f"⛔ Database connection failed:\n\n{_db_err}")
+            st.stop()
+        except Exception as _db_err:
+            st.error(f"⛔ Unexpected database error: {_db_err}")
+            st.stop()
 
         _b._bsc_cfg           = load_config()
         _b._bsc_log           = load_log()
