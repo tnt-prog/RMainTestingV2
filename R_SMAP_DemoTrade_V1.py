@@ -10,6 +10,8 @@ Performance improvements:
 """
 
 import base64, hashlib, hmac, json, math, os, pathlib, threading, time, uuid, traceback
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 
@@ -211,60 +213,81 @@ def analyze_sl_reason(sig: dict) -> str:
     return "\n".join(f"• {r}" for r in reasons)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Config persistence
+# Supabase persistence — all signals and config stored in PostgreSQL
+# Connection string read from st.secrets["supabase"]["db_url"]
 # ─────────────────────────────────────────────────────────────────────────────
-# Data is always saved to ~/Documents/CryptoDemoTrades/ — a fixed, reliable
-# location on the user's computer that survives app restarts, script moves,
-# and working-directory changes.  A fallback to the script's own directory is
-# tried first so that running multiple instances from different folders stays
-# independent; the home-Documents path is the final, always-writable fallback.
-
-def _resolve_data_dir() -> pathlib.Path:
-    candidates = []
-    # 1. Same directory as the script (keeps data next to code when writable)
-    try:
-        candidates.append(pathlib.Path(__file__).parent.absolute())
-    except Exception:
-        pass
-    # 2. Stable home-directory location — survives script moves & restarts
-    candidates.append(pathlib.Path.home() / "Documents" / "CryptoDemoTrades")
-
-    for path in candidates:
-        try:
-            path.mkdir(parents=True, exist_ok=True)
-            probe = path / ".write_probe"
-            probe.touch(); probe.unlink()
-            return path          # first writable candidate wins
-        except OSError:
-            continue
-
-    # Last resort: temp dir (data won't survive OS restart — shown in UI)
-    import tempfile
-    fallback = pathlib.Path(tempfile.gettempdir()) / "CryptoDemoTrades"
-    fallback.mkdir(parents=True, exist_ok=True)
-    return fallback
-
-_SCRIPT_DIR  = _resolve_data_dir()
-CONFIG_FILE  = _SCRIPT_DIR / "scanner_config.json"
-LOG_FILE     = _SCRIPT_DIR / "scanner_log.json"
 _config_lock = threading.Lock()
 
+def _get_conn():
+    """Return the shared psycopg2 connection stored in builtins."""
+    return getattr(_b, "_bsc_db_conn", None)
+
+def init_db():
+    """
+    Open a connection to Supabase PostgreSQL and return it.
+    Tables must already exist — create them once in the Supabase SQL editor:
+
+        CREATE TABLE IF NOT EXISTS signals (
+            id TEXT PRIMARY KEY, symbol TEXT, timestamp TEXT, status TEXT,
+            entry REAL, signal_entry REAL, tp REAL, sl REAL,
+            close_price REAL, close_time TEXT, sector TEXT,
+            is_super_setup INTEGER, max_lev INTEGER,
+            order_id TEXT, algo_id TEXT, order_sz INTEGER,
+            order_status TEXT, order_error TEXT,
+            trade_usdt REAL, trade_lev INTEGER, demo_mode INTEGER,
+            price_alert INTEGER, price_alert_pct REAL,
+            criteria TEXT, extra TEXT
+        );
+        CREATE TABLE IF NOT EXISTS scan_health (
+            id INTEGER PRIMARY KEY,
+            total_cycles INTEGER, last_scan_at TEXT,
+            last_scan_duration_s REAL, total_api_errors INTEGER,
+            watchlist_size INTEGER, pre_filtered_out INTEGER, deep_scanned INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS scanner_config (
+            id INTEGER PRIMARY KEY, config_json TEXT
+        );
+    """
+    db_url = st.secrets["supabase"]["db_url"]
+    conn   = psycopg2.connect(db_url, connect_timeout=15)
+    conn.autocommit = False
+    return conn
+
 def load_config() -> dict:
-    if CONFIG_FILE.exists():
-        try:
-            saved = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-            cfg   = dict(DEFAULT_CONFIG)
-            for k in DEFAULT_CONFIG:
-                if k in saved:
-                    cfg[k] = saved[k]
-            return cfg
-        except Exception:
-            pass
+    try:
+        conn = _get_conn()
+        if conn is None:
+            return dict(DEFAULT_CONFIG)
+        with conn.cursor() as cur:
+            cur.execute("SELECT config_json FROM scanner_config WHERE id=1")
+            row = cur.fetchone()
+            if row:
+                saved = json.loads(row[0])
+                cfg   = dict(DEFAULT_CONFIG)
+                for k in DEFAULT_CONFIG:
+                    if k in saved:
+                        cfg[k] = saved[k]
+                return cfg
+    except Exception:
+        pass
     return dict(DEFAULT_CONFIG)
 
 def save_config(cfg: dict):
     with _config_lock:
-        CONFIG_FILE.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+        conn = _get_conn()
+        if conn is None:
+            return
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO scanner_config (id, config_json)
+                    VALUES (1, %s)
+                    ON CONFLICT (id) DO UPDATE SET config_json = EXCLUDED.config_json
+                """, [json.dumps(cfg, indent=2)])
+            conn.commit()
+        except Exception:
+            try: conn.rollback()
+            except Exception: pass
 
 def _migrate_criteria(crit: dict) -> dict:
     """
@@ -274,7 +297,6 @@ def _migrate_criteria(crit: dict) -> dict:
     """
     if not crit:
         return crit
-    # Migrate flat MACD/SAR/Vol keys → per-timeframe keys
     if "macd" in crit and "macd_3m" not in crit:
         v = crit.pop("macd")
         crit["macd_3m"]  = None if v == "✅" else v
@@ -288,33 +310,105 @@ def _migrate_criteria(crit: dict) -> dict:
     if "vol" in crit and "vol_ratio" not in crit:
         v = crit.pop("vol")
         crit["vol_ratio"] = None if v == "✅" else v
-    # EMA: if stored as "✅" we have no actual value — set to None
     for key in ("ema_3m", "ema_5m", "ema_15m"):
         if crit.get(key) == "✅":
             crit[key] = None
     return crit
 
-def load_log():
-    if LOG_FILE.exists():
-        try:
-            data = json.loads(LOG_FILE.read_text(encoding="utf-8"))
-            # Migrate any pre-update signals transparently
-            for sig in data.get("signals", []):
+# ── Signal columns that get their own DB column (everything else → extra blob) ─
+_SIGNAL_COLS = {
+    "id","symbol","timestamp","status","entry","signal_entry",
+    "tp","sl","close_price","close_time","sector","is_super_setup",
+    "max_lev","order_id","algo_id","order_sz","order_status",
+    "order_error","trade_usdt","trade_lev","demo_mode",
+    "price_alert","price_alert_pct"
+}
+
+def _upsert_signal(cur, sig: dict):
+    """INSERT or UPDATE one signal row in the signals table."""
+    known  = {k: sig.get(k) for k in _SIGNAL_COLS}
+    known["criteria"] = json.dumps(sig.get("criteria") or {})
+    extra  = {k: v for k, v in sig.items()
+              if k not in _SIGNAL_COLS and k != "criteria"}
+    known["extra"] = json.dumps(extra) if extra else "{}"
+    cols   = list(known.keys())
+    vals   = [known[c] for c in cols]
+    update = ", ".join(f"{c}=EXCLUDED.{c}" for c in cols if c != "id")
+    sql    = (f"INSERT INTO signals ({','.join(cols)}) "
+              f"VALUES ({','.join(['%s']*len(cols))}) "
+              f"ON CONFLICT (id) DO UPDATE SET {update}")
+    cur.execute(sql, vals)
+
+def load_log() -> dict:
+    """Load all signals and health from Supabase."""
+    empty_health = {
+        "total_cycles": 0, "last_scan_at": None,
+        "last_scan_duration_s": 0.0, "total_api_errors": 0,
+        "watchlist_size": 0, "pre_filtered_out": 0, "deep_scanned": 0,
+    }
+    try:
+        conn = _get_conn()
+        if conn is None:
+            return {"health": empty_health, "signals": []}
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT * FROM signals ORDER BY timestamp")
+            rows = cur.fetchall()
+            signals = []
+            for row in rows:
+                sig = dict(row)
+                sig["criteria"]       = json.loads(sig.get("criteria") or "{}")
+                sig["is_super_setup"] = bool(sig.get("is_super_setup"))
+                sig["price_alert"]    = bool(sig.get("price_alert"))
+                sig["demo_mode"]      = bool(sig.get("demo_mode"))
+                extra = json.loads(sig.pop("extra", None) or "{}")
+                sig.update(extra)
+                # Migrate any legacy criteria format
                 if "criteria" in sig:
                     sig["criteria"] = _migrate_criteria(sig["criteria"])
-            return data
-        except Exception:
-            pass
-    return {"health": {"total_cycles": 0, "last_scan_at": None,
-                        "last_scan_duration_s": 0.0, "total_api_errors": 0,
-                        "watchlist_size": 0, "pre_filtered_out": 0,
-                        "deep_scanned": 0},
-            "signals": []}
+                signals.append(sig)
+            cur.execute("SELECT * FROM scan_health WHERE id=1")
+            h_row = cur.fetchone()
+            if h_row:
+                health = dict(h_row)
+                health.pop("id", None)
+            else:
+                health = empty_health
+            return {"health": health, "signals": signals}
+    except Exception:
+        return {"health": empty_health, "signals": []}
 
-def save_log(log):
-    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    LOG_FILE.write_text(json.dumps(log, indent=2), encoding="utf-8")
-
+def save_log(log: dict):
+    """Upsert all signals and update scan_health in Supabase."""
+    conn = _get_conn()
+    if conn is None:
+        return
+    try:
+        with conn.cursor() as cur:
+            for sig in log.get("signals", []):
+                if sig.get("id"):
+                    _upsert_signal(cur, sig)
+            h = log.get("health", {})
+            cur.execute("""
+                INSERT INTO scan_health
+                  (id, total_cycles, last_scan_at, last_scan_duration_s,
+                   total_api_errors, watchlist_size, pre_filtered_out, deep_scanned)
+                VALUES (1, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (id) DO UPDATE SET
+                  total_cycles         = EXCLUDED.total_cycles,
+                  last_scan_at         = EXCLUDED.last_scan_at,
+                  last_scan_duration_s = EXCLUDED.last_scan_duration_s,
+                  total_api_errors     = EXCLUDED.total_api_errors,
+                  watchlist_size       = EXCLUDED.watchlist_size,
+                  pre_filtered_out     = EXCLUDED.pre_filtered_out,
+                  deep_scanned         = EXCLUDED.deep_scanned
+            """, [h.get("total_cycles", 0), h.get("last_scan_at"),
+                  h.get("last_scan_duration_s", 0.0), h.get("total_api_errors", 0),
+                  h.get("watchlist_size", 0), h.get("pre_filtered_out", 0),
+                  h.get("deep_scanned", 0)])
+        conn.commit()
+    except Exception:
+        try: conn.rollback()
+        except Exception: pass
 # ─────────────────────────────────────────────────────────────────────────────
 # Module-level shared state
 # ─────────────────────────────────────────────────────────────────────────────
@@ -323,6 +417,8 @@ if "_scanner_initialised" not in st.session_state:
     if not getattr(builtins, "_binance_scanner_globals_set", False):
         import builtins as _b
         _b._binance_scanner_globals_set = True
+        _b._bsc_db_conn = init_db()   # open Supabase connection first
+
         _b._bsc_cfg           = load_config()
         _b._bsc_log           = load_log()
         _b._bsc_log_lock      = threading.Lock()
@@ -350,6 +446,7 @@ if "_scanner_initialised" not in st.session_state:
     st.session_state["_scanner_initialised"] = True
 
 import builtins as _b
+_db_conn = _b._bsc_db_conn   # module-level alias for convenience
 _cfg             = _b._bsc_cfg
 _log             = _b._bsc_log
 _log_lock        = _b._bsc_log_lock
@@ -1679,6 +1776,28 @@ def _bg_loop():
             cfg = dict(_b._bsc_cfg)
         t0 = time.time()
         try:
+            # Delete all data from Supabase tables
+
+            try:
+
+                conn = _get_conn()
+
+                if conn:
+
+                    with conn.cursor() as cur:
+
+                        cur.execute("DELETE FROM signals")
+
+                        cur.execute("DELETE FROM scan_health")
+
+                    conn.commit()
+
+            except Exception:
+
+                try: conn.rollback()
+
+                except Exception: pass
+
             with _log_lock:
                 _b._bsc_log["signals"] = update_open_signals(_b._bsc_log["signals"])
             new_sigs, errors = scan(cfg)
@@ -2156,16 +2275,11 @@ with st.sidebar:
     st.divider()
 
     st.markdown("**💾 Data Storage**")
-    _is_temp = str(_SCRIPT_DIR).startswith(str(pathlib.Path(__import__("tempfile").gettempdir())))
-    if _is_temp:
-        st.warning(
-            f"⚠️ Saving to **temp directory** — data will be lost on OS restart!\n\n"
-            f"`{_SCRIPT_DIR}`\n\n"
-            "Move the script to a writable folder (e.g. Documents) to fix this.")
+    _db_ok = getattr(_b, "_bsc_db_conn", None) is not None
+    if _db_ok:
+        st.success("🟢 Supabase connected — data persists across restarts")
     else:
-        st.caption(f"📁 Data folder: `{_SCRIPT_DIR}`")
-        st.caption(f"  • `scanner_log.json` — all signals (loaded on restart)")
-        st.caption(f"  • `scanner_config.json` — filters, API keys, settings")
+        st.error("🔴 Supabase not connected — check secrets.toml")
     st.divider()
 
     st.markdown("**🗑 Clear History**")
